@@ -568,34 +568,51 @@ def process_pdf(pdf_path: Path, dpi: int, mode: str, overwrite: bool) -> None:
         print(f"原始图片：{original_dir}")
         print(f"处理图片：{processed_dir}")
         print(f"模式：{mode}\n")
+        print("阶段 1/2：提取并保存全部原始页面", flush=True)
 
         for index, page in enumerate(document):
             filename = f"{index + 1:0{digits}d}.png"
             original_path = original_dir / filename
-            processed_path = processed_dir / filename
 
             if overwrite or not valid_existing_png(original_path):
                 original = page_to_image(document, page, dpi)
                 save_png(original, original_path, dpi)
                 original_status = "提取"
             else:
-                with Image.open(original_path) as opened:
-                    original = normalize_image(opened)
-                    original.load()
                 original_status = "沿用"
 
-            if overwrite or not valid_existing_png(processed_path, PROCESSOR_VERSION):
-                processed = process_image(original, mode)
-                save_png(processed, processed_path, dpi, PROCESSOR_VERSION)
-                processed_status = "处理"
-            else:
-                processed_status = "跳过"
-
             print(
-                f"[{index + 1:0{digits}d}/{total}] "
-                f"原图:{original_status}  处理图:{processed_status}",
+                f"[提取 {index + 1:0{digits}d}/{total}] 原图:{original_status}",
                 flush=True,
             )
+
+    # Do not begin cleanup until every source page has been saved.  Processing
+    # from the saved PNGs also makes the two stages independently resumable.
+    print("\n全部原始页面已经保存。", flush=True)
+    print("阶段 2/2：依次处理已保存的页面", flush=True)
+
+    for index in range(total):
+        filename = f"{index + 1:0{digits}d}.png"
+        original_path = original_dir / filename
+        processed_path = processed_dir / filename
+
+        if not valid_existing_png(original_path):
+            raise RuntimeError(f"原始页面图片无效或缺失：{original_path}")
+
+        if overwrite or not valid_existing_png(processed_path, PROCESSOR_VERSION):
+            with Image.open(original_path) as opened:
+                original = normalize_image(opened)
+                original.load()
+            processed = process_image(original, mode)
+            save_png(processed, processed_path, dpi, PROCESSOR_VERSION)
+            processed_status = "处理"
+        else:
+            processed_status = "跳过"
+
+        print(
+            f"[处理 {index + 1:0{digits}d}/{total}] 处理图:{processed_status}",
+            flush=True,
+        )
 
     print("\n完成。请先抽查文字、手写内容、灰色图形和黄色插图，再导入 Epson DCP。")
 
