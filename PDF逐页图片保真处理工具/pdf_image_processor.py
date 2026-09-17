@@ -26,7 +26,7 @@ from PIL import Image, ImageOps, PngImagePlugin
 from scipy import ndimage
 
 
-PROCESSOR_VERSION = "8-raw-source-refresh"
+PROCESSOR_VERSION = "9-complete-photo-rectangle"
 
 
 def select_pdfs_with_dialog() -> list[Path]:
@@ -235,7 +235,6 @@ def detect_photo_regions(
     photo_mask = np.zeros(gray.shape, dtype=bool)
     min_area = max(2500, int(height * width * 0.00045))
     min_dimension = max(35, int(short_side * 0.025))
-    padding = max(3, window // 4)
 
     for label_id, bounds in enumerate(objects, 1):
         if bounds is None:
@@ -253,6 +252,14 @@ def detect_photo_regions(
         ):
             continue
 
+        # A pale, low-texture corner may lie just outside the evidence box.
+        # Use a proportional safety margin for large photo candidates instead
+        # of globally joining distant components (which can absorb body text).
+        padding = max(
+            3,
+            window // 4,
+            min(120, int(min(box_height, box_width) * 0.085)),
+        )
         y0 = max(0, ys.start - padding)
         y1 = min(height, ys.stop + padding)
         x0 = max(0, xs.start - padding)
