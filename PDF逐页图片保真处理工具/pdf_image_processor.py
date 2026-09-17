@@ -19,8 +19,11 @@ from pathlib import Path
 
 import fitz  # PyMuPDF
 import numpy as np
-from PIL import Image, ImageOps
+from PIL import Image, ImageOps, PngImagePlugin
 from scipy import ndimage
+
+
+PROCESSOR_VERSION = "4-handwriting-strokes"
 
 
 def select_pdf_with_dialog() -> Path | None:
@@ -133,8 +136,26 @@ def process_grayscale(image: Image.Image, mode: str) -> Image.Image:
     sizes = np.bincount(labels.ravel(), minlength=count + 1)
     dark_core = ndimage.sum(gray < (105 if mode == "strong" else 115), labels, range(count + 1)) > 0
     dark_content = dark_core & (sizes >= (8 if mode == "strong" else 6))
+
+    # Pencil and light-ink handwriting may have no near-black pixels at all.
+    # A grayscale morphological black-hat response detects thin strokes by
+    # comparing them with their local paper background. Preserve a component
+    # when several of its pixels form such locally dark strokes. Broad stains
+    # and uneven paper shading have a much weaker response and remain cleanable.
+    local_paper = ndimage.grey_closing(gray, size=(15, 15), mode="nearest")
+    stroke_response = local_paper.astype(np.int16) - gray.astype(np.int16)
+    stroke_seed = (stroke_response >= (7 if mode == "strong" else 5)) & (gray < 246)
+    stroke_pixels = ndimage.sum(stroke_seed, labels, range(count + 1))
+    handwriting_stroke = (stroke_pixels >= (5 if mode == "strong" else 3)) & (
+        sizes >= (10 if mode == "strong" else 7)
+    )
+    # On severely mottled photocopies, dirt itself consists of thousands of
+    # short stroke-like fragments. Do not enable the pencil heuristic there;
+    # the conservative mode still remains available when notes take priority.
+    foreground_density = float(np.mean(component_mask))
+    handwriting_stroke &= foreground_density < (0.035 if mode == "strong" else 0.060)
     large_gray = sizes >= (20000 if mode == "strong" else 12000)
-    keep_label = dark_content | large_gray
+    keep_label = dark_content | handwriting_stroke | large_gray
     keep_label[0] = False
     protected = keep_label[labels]
 
@@ -279,16 +300,26 @@ def process_image(image: Image.Image, mode: str) -> Image.Image:
     return Image.fromarray(cleaned, "RGB")
 
 
-def save_png(image: Image.Image, path: Path, dpi: int) -> None:
+def save_png(
+    image: Image.Image, path: Path, dpi: int, processor_version: str | None = None
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    image.save(path, "PNG", compress_level=6, dpi=(dpi, dpi))
+    pnginfo = None
+    if processor_version is not None:
+        pnginfo = PngImagePlugin.PngInfo()
+        pnginfo.add_text("pdf_image_processor_version", processor_version)
+    image.save(path, "PNG", compress_level=6, dpi=(dpi, dpi), pnginfo=pnginfo)
 
 
-def valid_existing_png(path: Path) -> bool:
+def valid_existing_png(path: Path, expected_version: str | None = None) -> bool:
     if not path.is_file():
         return False
     try:
         with Image.open(path) as image:
+            if expected_version is not None and image.info.get(
+                "pdf_image_processor_version"
+            ) != expected_version:
+                return False
             image.verify()
         return True
     except Exception:
@@ -332,9 +363,9 @@ def process_pdf(pdf_path: Path, dpi: int, mode: str, overwrite: bool) -> None:
                     original.load()
                 original_status = "沿用"
 
-            if overwrite or not valid_existing_png(processed_path):
+            if overwrite or not valid_existing_png(processed_path, PROCESSOR_VERSION):
                 processed = process_image(original, mode)
-                save_png(processed, processed_path, dpi)
+                save_png(processed, processed_path, dpi, PROCESSOR_VERSION)
                 processed_status = "处理"
             else:
                 processed_status = "跳过"
