@@ -31,19 +31,25 @@ macOS：
 三、运行
 
 最简单的方法：
-    Windows双击“run-windows.bat”，然后把PDF拖入黑色窗口并按回车。
-    也可以直接把PDF文件拖到“run-windows.bat”图标上。
+    Windows双击“run-windows.bat”，把一个或多个PDF拖入命令窗口，然后按回车。
+    也可以同时选中多个PDF并拖到“run-windows.bat”图标上。
     该启动器内部只使用ASCII字符和Windows CRLF换行，避免中文代码页破坏命令。
-    macOS双击“macOS-运行.command”
+    macOS双击“macOS-运行.command”，把一个或多个PDF拖入终端窗口，然后按回车。
 
 Windows启动器会检查Python和依赖；首次运行缺少依赖时会自动安装。
 如果失败，窗口会保留并显示具体错误，不会直接退出。
 
-macOS随后会显示文件选择窗口。
+每批文件全部处理完后，程序会回到常驻等待界面，可继续拖入下一批文件，不会自动退出。
+在等待界面直接按回车，可以打开文件多选窗口；取消多选窗口只会返回等待界面，不会退出。
+只有输入Q并按回车才会退出程序。
 
 也可以使用命令行：
     python pdf_image_processor.py "D:\扫描\书名.pdf"
     python3 pdf_image_processor.py "/Users/name/Scans/书名.pdf"
+    python pdf_image_processor.py "第一本.pdf" "第二本.pdf"
+
+命令行如需只处理一次并立即退出，可增加：
+    --once
 
 
 四、处理模式

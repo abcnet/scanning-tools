@@ -27,7 +27,7 @@ echo.
 echo Checking Python packages...
 call %PYTHON_CMD% -c "import fitz, PIL, numpy, scipy" >nul 2>&1
 if errorlevel 1 goto INSTALL_DEPS
-goto GET_PDF
+goto RUN_PROCESSOR
 
 :INSTALL_DEPS
 echo Required packages are missing.
@@ -37,26 +37,13 @@ echo.
 call %PYTHON_CMD% -m pip install -r "%~dp0requirements.txt"
 if errorlevel 1 goto INSTALL_FAILED
 
-:GET_PDF
-if not "%~1"=="" goto PDF_FROM_ARGUMENT
+:RUN_PROCESSOR
 echo.
-echo Drag the PDF file into this window, then press Enter.
-set /p "PDF_FILE=PDF path: "
-set "PDF_FILE=%PDF_FILE:"=%"
-goto CHECK_FILE
-
-:PDF_FROM_ARGUMENT
-set "PDF_FILE=%~1"
-
-:CHECK_FILE
-if not defined PDF_FILE goto NO_FILE
-if not exist "%PDF_FILE%" goto FILE_NOT_FOUND
-
+echo Drag one or more PDF files into this window, then press Enter.
+echo Press Enter on an empty line to open the file picker.
+echo After each batch, the program keeps waiting. Type Q to exit.
 echo.
-echo Processing:
-echo "%PDF_FILE%"
-echo.
-call %PYTHON_CMD% "%~dp0pdf_image_processor.py" "%PDF_FILE%"
+call %PYTHON_CMD% "%~dp0pdf_image_processor.py" %*
 if errorlevel 1 goto PROCESS_FAILED
 
 echo.
@@ -75,17 +62,6 @@ goto END
 echo.
 echo ERROR: Package installation failed.
 echo Check the messages above and your network connection.
-goto END
-
-:NO_FILE
-echo.
-echo ERROR: No PDF path was entered.
-goto END
-
-:FILE_NOT_FOUND
-echo.
-echo ERROR: The selected file does not exist:
-echo "%PDF_FILE%"
 goto END
 
 :PROCESS_FAILED

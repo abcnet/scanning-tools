@@ -14,6 +14,9 @@ from __future__ import annotations
 
 import argparse
 import io
+import os
+import shlex
+import subprocess
 import sys
 from pathlib import Path
 
@@ -26,7 +29,7 @@ from scipy import ndimage
 PROCESSOR_VERSION = "5-edge-strips"
 
 
-def select_pdf_with_dialog() -> Path | None:
+def select_pdfs_with_dialog() -> list[Path]:
     try:
         import tkinter as tk
         from tkinter import filedialog
@@ -34,14 +37,71 @@ def select_pdf_with_dialog() -> Path | None:
         root = tk.Tk()
         root.withdraw()
         root.update()
-        selected = filedialog.askopenfilename(
-            title="选择需要处理的 PDF",
+        selected = filedialog.askopenfilenames(
+            title="选择一个或多个需要处理的 PDF",
             filetypes=[("PDF files", "*.pdf"), ("All files", "*.*")],
         )
         root.destroy()
-        return Path(selected) if selected else None
+        return [Path(item) for item in selected]
     except Exception:
-        return None
+        pass
+
+    if sys.platform == "darwin":
+        script = '''
+set chosenFiles to choose file with prompt "选择一个或多个需要处理的 PDF" of type {"com.adobe.pdf"} with multiple selections allowed
+set outputText to ""
+repeat with chosenFile in chosenFiles
+    set outputText to outputText & POSIX path of chosenFile & linefeed
+end repeat
+return outputText
+'''
+        try:
+            result = subprocess.run(
+                ["osascript", "-e", script],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode == 0:
+                return [Path(line) for line in result.stdout.splitlines() if line]
+            return []
+        except Exception:
+            pass
+
+    return []
+
+
+def parse_dragged_paths(raw: str) -> list[Path]:
+    try:
+        return [Path(item.strip('"')) for item in shlex.split(raw, posix=os.name != "nt")]
+    except ValueError:
+        return [Path(raw.strip('"'))]
+
+
+def request_pdf_batch() -> list[Path] | None:
+    """Wait for dragged paths, or optionally use the multi-file picker.
+
+    Returning None is an explicit quit request. Cancelling the picker merely
+    returns to this prompt so the long-running launcher remains available.
+    """
+    while True:
+        print("\n请把一个或多个 PDF 拖入此窗口，然后按回车。")
+        print("直接按回车：打开多选窗口    Q：退出程序")
+        try:
+            raw = input("> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return None
+
+        if raw.lower() in {"q", "quit", "exit"}:
+            return None
+        if raw:
+            return parse_dragged_paths(raw)
+
+        selected = select_pdfs_with_dialog()
+        if selected:
+            return selected
+        print("已取消文件选择。程序仍在运行，可继续拖入 PDF；输入 Q 才会退出。")
 
 
 def normalize_image(image: Image.Image) -> Image.Image:
@@ -434,7 +494,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="逐页提取 PDF 图片并进行非生成式、保真的纸张背景清理。"
     )
-    parser.add_argument("pdf", nargs="?", type=Path, help="需要处理的 PDF 路径")
+    parser.add_argument("pdf", nargs="*", type=Path, help="一个或多个需要处理的 PDF 路径")
     parser.add_argument("--dpi", type=int, default=300, help="复杂页面回退渲染 DPI，默认300")
     parser.add_argument(
         "--mode",
@@ -447,28 +507,52 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="覆盖已存在的逐页图片；默认跳过完整的现有页面，便于断点续跑",
     )
+    parser.add_argument(
+        "--once",
+        action="store_true",
+        help="处理命令行中的文件后立即退出，不继续弹出选择窗口",
+    )
     return parser
 
 
 def main() -> int:
     args = build_parser().parse_args()
-    pdf_path = args.pdf
-    if pdf_path is None:
-        pdf_path = select_pdf_with_dialog()
-    if pdf_path is None:
-        print("未选择 PDF。也可以把 PDF 路径作为命令行参数传入。")
-        return 1
-
     if args.dpi < 72 or args.dpi > 1200:
         print("DPI 必须在72到1200之间。", file=sys.stderr)
         return 2
 
-    try:
-        process_pdf(pdf_path, args.dpi, args.mode, args.overwrite)
-        return 0
-    except Exception as exc:
-        print(f"错误：{exc}", file=sys.stderr)
-        return 2
+    pending = list(args.pdf)
+    had_error = False
+    first_batch = True
+
+    while True:
+        if not pending:
+            if args.once and not first_batch:
+                break
+            requested = request_pdf_batch()
+            if requested is None:
+                print("\n已退出程序。")
+                break
+            pending = requested
+
+        print(f"\n本批次共 {len(pending)} 个 PDF。")
+        for batch_index, pdf_path in enumerate(pending, 1):
+            print("\n" + "=" * 72)
+            print(f"批次文件 [{batch_index}/{len(pending)}]")
+            try:
+                process_pdf(pdf_path, args.dpi, args.mode, args.overwrite)
+            except Exception as exc:
+                had_error = True
+                print(f"错误：{exc}", file=sys.stderr)
+                print("已跳过此文件，继续处理本批次的其他 PDF。", file=sys.stderr)
+
+        pending = []
+        first_batch = False
+        if args.once:
+            break
+        print("\n本批次处理完毕。程序继续等待下一批 PDF。")
+
+    return 2 if had_error else 0
 
 
 if __name__ == "__main__":
