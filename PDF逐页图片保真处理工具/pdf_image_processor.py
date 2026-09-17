@@ -23,7 +23,7 @@ from PIL import Image, ImageOps, PngImagePlugin
 from scipy import ndimage
 
 
-PROCESSOR_VERSION = "4-handwriting-strokes"
+PROCESSOR_VERSION = "5-edge-strips"
 
 
 def select_pdf_with_dialog() -> Path | None:
@@ -116,6 +116,56 @@ def page_to_image(document: fitz.Document, page: fitz.Page, dpi: int) -> Image.I
     return normalize_image(Image.frombytes("RGB", (pixmap.width, pixmap.height), pixmap.samples))
 
 
+def clean_grayscale_borders(gray: np.ndarray) -> np.ndarray:
+    """Whiten scanner-bed strips connected to an outer image edge.
+
+    Some scanners include a 5-10 mm gray band beyond the paper plus a dark
+    paper/bed boundary line. Detection starts at each outermost row/column and
+    stops after several consecutive paper-like lines, so internal content and
+    graphics near (but not touching) the edge are not treated as borders.
+    """
+    result = gray.copy()
+    height, width = result.shape
+    center = result[height // 4 : 3 * height // 4, width // 4 : 3 * width // 4]
+    paper = float(np.percentile(center, 70))
+    bright_cutoff = max(210.0, paper - 17.0)
+
+    def strip_depth(lines: np.ndarray, max_depth: int) -> int:
+        medians = np.median(lines[:max_depth], axis=1)
+        bright_share = np.mean(lines[:max_depth] >= bright_cutoff, axis=1)
+        bad = (medians < paper - 20.0) | (bright_share < 0.65)
+        # Never remove a border unless the physical outer edge itself looks
+        # unlike paper. This prevents a nearby heading or illustration from
+        # triggering cleanup.
+        if not bool(bad[0]):
+            return 0
+        clean_run = 0
+        for index, is_bad in enumerate(bad):
+            clean_run = 0 if is_bad else clean_run + 1
+            if clean_run >= 6:
+                # Include a small inward safety margin for the dark paper/bed
+                # boundary line that commonly precedes the uniform gray band.
+                return min(max_depth, index - clean_run + 1 + 8)
+        return max_depth if bool(np.mean(bad[-6:]) > 0.5) else 0
+
+    max_y = max(1, int(height * 0.06))
+    max_x = max(1, int(width * 0.06))
+    top = strip_depth(result, max_y)
+    bottom = strip_depth(result[::-1, :], max_y)
+    left = strip_depth(result.T, max_x)
+    right = strip_depth(result[:, ::-1].T, max_x)
+
+    if top:
+        result[:top, :] = 255
+    if bottom:
+        result[height - bottom :, :] = 255
+    if left:
+        result[:, :left] = 255
+    if right:
+        result[:, width - right :] = 255
+    return result
+
+
 def process_grayscale(image: Image.Image, mode: str) -> Image.Image:
     """Clean scanned paper while keeping genuine gray shapes neutral.
 
@@ -126,6 +176,7 @@ def process_grayscale(image: Image.Image, mode: str) -> Image.Image:
     software cannot introduce yellow/blue chroma speckles.
     """
     gray = np.asarray(image.convert("L"), dtype=np.uint8)
+    gray = clean_grayscale_borders(gray)
     result = gray.copy()
 
     # Content components are built from mid/dark pixels. Text antialiasing is
