@@ -13,7 +13,7 @@ background pixels are whitened.
 from __future__ import annotations
 
 import argparse
-import io
+import hashlib
 import os
 import shlex
 import subprocess
@@ -26,7 +26,7 @@ from PIL import Image, ImageOps, PngImagePlugin
 from scipy import ndimage
 
 
-PROCESSOR_VERSION = "7-photo-border-priority"
+PROCESSOR_VERSION = "8-raw-source-refresh"
 
 
 def select_pdfs_with_dialog() -> list[Path]:
@@ -122,14 +122,16 @@ def normalize_image(image: Image.Image) -> Image.Image:
     return rgb
 
 
-def dominant_embedded_image(document: fitz.Document, page: fitz.Page) -> Image.Image | None:
-    """Return a full-page scan image when the page clearly contains one.
+def dominant_embedded_image_data(
+    document: fitz.Document, page: fitz.Page
+) -> tuple[bytes, str] | None:
+    """Return untouched bytes and the extension of a full-page scan image.
 
     Complex PDFs, masked images, or pages with no dominant raster image fall
     back to rendering, which preserves their visible page appearance.
     """
     page_area = max(page.rect.width * page.rect.height, 1.0)
-    candidates: list[tuple[float, int, int, int]] = []
+    candidates: list[tuple[float, int, int, int, int]] = []
 
     for info in page.get_images(full=True):
         xref, smask, width, height = info[0], info[1], info[2], info[3]
@@ -140,38 +142,36 @@ def dominant_embedded_image(document: fitz.Document, page: fitz.Page) -> Image.I
             (max(rect.width, 0) * max(rect.height, 0) / page_area for rect in rects),
             default=0.0,
         )
-        candidates.append((coverage, width * height, xref, width))
+        candidates.append((coverage, width * height, xref, width, height))
 
     if not candidates:
         return None
 
-    coverage, _pixel_area, xref, _width = max(candidates)
+    coverage, _pixel_area, xref, width, height = max(candidates)
     if coverage < 0.82:
         return None
 
     try:
-        payload = document.extract_image(xref)["image"]
-        with Image.open(io.BytesIO(payload)) as opened:
-            image = normalize_image(opened)
-            image.load()
-
         page_ratio = page.rect.width / max(page.rect.height, 1.0)
-        image_ratio = image.width / max(image.height, 1)
-        rotated_ratio = image.height / max(image.width, 1)
+        image_ratio = width / max(height, 1)
+        rotated_ratio = height / max(width, 1)
         if abs(rotated_ratio - page_ratio) < abs(image_ratio - page_ratio):
             # The placement transform determines whether this is 90 or 270
             # degrees. Render the visible page instead of guessing.
             return None
-        return image
+        extracted = document.extract_image(xref)
+        payload = extracted["image"]
+        extension = str(extracted.get("ext", "bin")).lower().lstrip(".")
+        if extension == "jpeg":
+            extension = "jpg"
+        if not payload or not extension or extension == "bin":
+            return None
+        return payload, extension
     except Exception:
         return None
 
 
-def page_to_image(document: fitz.Document, page: fitz.Page, dpi: int) -> Image.Image:
-    image = dominant_embedded_image(document, page)
-    if image is not None:
-        return image
-
+def render_page_image(page: fitz.Page, dpi: int) -> Image.Image:
     pixmap = page.get_pixmap(dpi=dpi, colorspace=fitz.csRGB, alpha=False, annots=True)
     return normalize_image(Image.frombytes("RGB", (pixmap.width, pixmap.height), pixmap.samples))
 
@@ -522,17 +522,27 @@ def process_image(image: Image.Image, mode: str) -> Image.Image:
 
 
 def save_png(
-    image: Image.Image, path: Path, dpi: int, processor_version: str | None = None
+    image: Image.Image,
+    path: Path,
+    dpi: int,
+    processor_version: str | None = None,
+    source_sha256: str | None = None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     pnginfo = None
     if processor_version is not None:
         pnginfo = PngImagePlugin.PngInfo()
         pnginfo.add_text("pdf_image_processor_version", processor_version)
+        if source_sha256 is not None:
+            pnginfo.add_text("source_sha256", source_sha256)
     image.save(path, "PNG", compress_level=6, dpi=(dpi, dpi), pnginfo=pnginfo)
 
 
-def valid_existing_png(path: Path, expected_version: str | None = None) -> bool:
+def valid_existing_png(
+    path: Path,
+    expected_version: str | None = None,
+    expected_source_sha256: str | None = None,
+) -> bool:
     if not path.is_file():
         return False
     try:
@@ -541,10 +551,30 @@ def valid_existing_png(path: Path, expected_version: str | None = None) -> bool:
                 "pdf_image_processor_version"
             ) != expected_version:
                 return False
+            if expected_source_sha256 is not None and image.info.get(
+                "source_sha256"
+            ) != expected_source_sha256:
+                return False
             image.verify()
         return True
     except Exception:
         return False
+
+
+ORIGINAL_IMAGE_SUFFIXES = {
+    ".jpg", ".jpeg", ".jp2", ".jpx", ".png", ".tif", ".tiff", ".bmp", ".pbm"
+}
+
+
+def remove_other_page_images(directory: Path, stem: str, keep: Path) -> None:
+    """Remove obsolete generated variants such as both 001.png and 001.jpg."""
+    for candidate in directory.glob(f"{stem}.*"):
+        if (
+            candidate != keep
+            and candidate.is_file()
+            and candidate.suffix.lower() in ORIGINAL_IMAGE_SUFFIXES
+        ):
+            candidate.unlink()
 
 
 def process_pdf(pdf_path: Path, dpi: int, mode: str, overwrite: bool) -> None:
@@ -556,6 +586,8 @@ def process_pdf(pdf_path: Path, dpi: int, mode: str, overwrite: bool) -> None:
     processed_dir = pdf_path.parent / f"{pdf_path.stem}-processed"
     original_dir.mkdir(exist_ok=True)
     processed_dir.mkdir(exist_ok=True)
+
+    original_paths: list[Path] = []
 
     with fitz.open(pdf_path) as document:
         total = document.page_count
@@ -571,15 +603,28 @@ def process_pdf(pdf_path: Path, dpi: int, mode: str, overwrite: bool) -> None:
         print("阶段 1/2：提取并保存全部原始页面", flush=True)
 
         for index, page in enumerate(document):
-            filename = f"{index + 1:0{digits}d}.png"
-            original_path = original_dir / filename
+            stem = f"{index + 1:0{digits}d}"
+            embedded = dominant_embedded_image_data(document, page)
 
-            if overwrite or not valid_existing_png(original_path):
-                original = page_to_image(document, page, dpi)
-                save_png(original, original_path, dpi)
-                original_status = "提取"
+            if embedded is not None:
+                payload, extension = embedded
+                original_path = original_dir / f"{stem}.{extension}"
+                if overwrite or not original_path.is_file() or original_path.read_bytes() != payload:
+                    original_path.write_bytes(payload)
+                    original_status = f"原始流({extension})"
+                else:
+                    original_status = f"沿用原始流({extension})"
             else:
-                original_status = "沿用"
+                original_path = original_dir / f"{stem}.png"
+                if overwrite or not valid_existing_png(original_path):
+                    rendered = render_page_image(page, dpi)
+                    save_png(rendered, original_path, dpi)
+                    original_status = "渲染PNG"
+                else:
+                    original_status = "沿用渲染PNG"
+
+            remove_other_page_images(original_dir, stem, original_path)
+            original_paths.append(original_path)
 
             print(
                 f"[提取 {index + 1:0{digits}d}/{total}] 原图:{original_status}",
@@ -592,19 +637,29 @@ def process_pdf(pdf_path: Path, dpi: int, mode: str, overwrite: bool) -> None:
     print("阶段 2/2：依次处理已保存的页面", flush=True)
 
     for index in range(total):
-        filename = f"{index + 1:0{digits}d}.png"
-        original_path = original_dir / filename
-        processed_path = processed_dir / filename
+        stem = f"{index + 1:0{digits}d}"
+        original_path = original_paths[index]
+        processed_path = processed_dir / f"{stem}.png"
 
         if not valid_existing_png(original_path):
             raise RuntimeError(f"原始页面图片无效或缺失：{original_path}")
 
-        if overwrite or not valid_existing_png(processed_path, PROCESSOR_VERSION):
+        source_sha256 = hashlib.sha256(original_path.read_bytes()).hexdigest()
+
+        if overwrite or not valid_existing_png(
+            processed_path, PROCESSOR_VERSION, source_sha256
+        ):
             with Image.open(original_path) as opened:
                 original = normalize_image(opened)
                 original.load()
             processed = process_image(original, mode)
-            save_png(processed, processed_path, dpi, PROCESSOR_VERSION)
+            save_png(
+                processed,
+                processed_path,
+                dpi,
+                PROCESSOR_VERSION,
+                source_sha256,
+            )
             processed_status = "处理"
         else:
             processed_status = "跳过"
