@@ -26,7 +26,7 @@ from PIL import Image, ImageOps, PngImagePlugin
 from scipy import ndimage
 
 
-PROCESSOR_VERSION = "5-edge-strips"
+PROCESSOR_VERSION = "7-photo-border-priority"
 
 
 def select_pdfs_with_dialog() -> list[Path]:
@@ -176,6 +176,92 @@ def page_to_image(document: fitz.Document, page: fitz.Page, dpi: int) -> Image.I
     return normalize_image(Image.frombytes("RGB", (pixmap.width, pixmap.height), pixmap.samples))
 
 
+def detect_photo_regions(
+    gray: np.ndarray, saturation: np.ndarray | None = None
+) -> np.ndarray:
+    """Detect photographic blocks and protect their complete rectangular area.
+
+    Text has many hard edges but little continuously varying midtone texture.
+    Photos normally contain both.  Color variation is additional evidence but
+    is not required, so monochrome photographs are protected as well.  Once a
+    sufficiently large photographic component is found, its bounding rectangle
+    is protected; this intentionally includes flat sky, walls, and other
+    low-texture backgrounds inside the photograph.
+    """
+    gray_f = gray.astype(np.float32)
+    height, width = gray.shape
+    short_side = min(height, width)
+    window = max(31, min(81, int(short_side * 0.018) | 1))
+
+    local_mean = ndimage.uniform_filter(gray_f, size=window, mode="nearest")
+    local_sq = ndimage.uniform_filter(gray_f * gray_f, size=window, mode="nearest")
+    local_std = np.sqrt(np.maximum(local_sq - local_mean * local_mean, 0.0))
+    grad_x = ndimage.sobel(gray_f, axis=1, mode="nearest")
+    grad_y = ndimage.sobel(gray_f, axis=0, mode="nearest")
+    gradient = np.hypot(grad_x, grad_y)
+
+    midtone_density = ndimage.uniform_filter(
+        ((gray_f > 35.0) & (gray_f < 238.0)).astype(np.float32),
+        size=window,
+        mode="nearest",
+    )
+    texture_density = ndimage.uniform_filter(
+        (gradient > 20.0).astype(np.float32), size=window, mode="nearest"
+    )
+    evidence = (
+        (midtone_density > 0.26)
+        & (texture_density > 0.075)
+        & (local_std > 12.0)
+    )
+
+    if saturation is not None:
+        color_density = ndimage.uniform_filter(
+            (saturation > 28.0).astype(np.float32), size=window, mode="nearest"
+        )
+        evidence |= (
+            (color_density > 0.10)
+            & (midtone_density > 0.14)
+            & (local_std > 8.0)
+        )
+
+    # Join nearby evidence within the same photograph without allowing sparse
+    # text lines to grow into a page-sized protected region.
+    join_size = max(5, window // 3)
+    joined = ndimage.maximum_filter(evidence, size=join_size, mode="nearest")
+    joined = ndimage.minimum_filter(joined, size=join_size, mode="nearest")
+    labels, count = ndimage.label(joined)
+    objects = ndimage.find_objects(labels)
+
+    photo_mask = np.zeros(gray.shape, dtype=bool)
+    min_area = max(2500, int(height * width * 0.00045))
+    min_dimension = max(35, int(short_side * 0.025))
+    padding = max(3, window // 4)
+
+    for label_id, bounds in enumerate(objects, 1):
+        if bounds is None:
+            continue
+        ys, xs = bounds
+        box_height = ys.stop - ys.start
+        box_width = xs.stop - xs.start
+        box_area = box_height * box_width
+        component_area = int(np.count_nonzero(labels[ys, xs] == label_id))
+        if (
+            component_area < min_area
+            or box_height < min_dimension
+            or box_width < min_dimension
+            or component_area / max(box_area, 1) < 0.16
+        ):
+            continue
+
+        y0 = max(0, ys.start - padding)
+        y1 = min(height, ys.stop + padding)
+        x0 = max(0, xs.start - padding)
+        x1 = min(width, xs.stop + padding)
+        photo_mask[y0:y1, x0:x1] = True
+
+    return photo_mask
+
+
 def clean_grayscale_borders(gray: np.ndarray) -> np.ndarray:
     """Whiten scanner-bed strips connected to an outer image edge.
 
@@ -235,8 +321,10 @@ def process_grayscale(image: Image.Image, mode: str) -> Image.Image:
     result deliberately remains one-channel grayscale, so downstream OCR
     software cannot introduce yellow/blue chroma speckles.
     """
-    gray = np.asarray(image.convert("L"), dtype=np.uint8)
-    gray = clean_grayscale_borders(gray)
+    original = np.asarray(image.convert("L"), dtype=np.uint8)
+    photo_mask = detect_photo_regions(original)
+    gray = clean_grayscale_borders(original)
+    border_changed = gray != original
     result = gray.copy()
 
     # Content components are built from mid/dark pixels. Text antialiasing is
@@ -290,6 +378,11 @@ def process_grayscale(image: Image.Image, mode: str) -> Image.Image:
     erase_label = (fleck_sizes <= (30 if mode == "strong" else 16)) & ~fleck_dark
     erase_label[0] = False
     result[erase_label[flecks] & ~protected] = 255
+    # Scanner-bed strips and physical page borders have higher priority than
+    # photo protection.  Otherwise a photo mask reaching an outer edge would
+    # restore the gray/black strip that clean_grayscale_borders just removed.
+    restore_photo = photo_mask & ~border_changed
+    result[restore_photo] = original[restore_photo]
     return Image.fromarray(result, "L")
 
 
@@ -356,8 +449,17 @@ def process_image(image: Image.Image, mode: str) -> Image.Image:
     if image.mode == "L":
         return process_grayscale(image, mode)
 
-    rgb = np.asarray(image, dtype=np.uint8)
-    rgb = clean_uniform_borders(rgb)
+    original_rgb = np.asarray(image, dtype=np.uint8)
+    original_hsv = np.asarray(Image.fromarray(original_rgb, "RGB").convert("HSV"))
+    original_gray = (
+        0.2126 * original_rgb[:, :, 0]
+        + 0.7152 * original_rgb[:, :, 1]
+        + 0.0722 * original_rgb[:, :, 2]
+    ).astype(np.float32)
+    photo_mask = detect_photo_regions(original_gray, original_hsv[:, :, 1])
+
+    rgb = clean_uniform_borders(original_rgb)
+    border_changed = np.any(rgb != original_rgb, axis=2)
 
     hsv = np.asarray(Image.fromarray(rgb, "RGB").convert("HSV"))
     saturation = hsv[:, :, 1].astype(np.float32)
@@ -399,7 +501,11 @@ def process_image(image: Image.Image, mode: str) -> Image.Image:
     # Protect original text strokes, gray graphics, colored content and their
     # immediate antialiased edges. Protected pixels are copied unchanged.
     protected_seed = (gray < 205.0) | (saturation > 70.0) | (gradient > 28.0)
-    protected = ndimage.binary_dilation(protected_seed, iterations=2) | color_region
+    protected = (
+        ndimage.binary_dilation(protected_seed, iterations=2)
+        | color_region
+        | photo_mask
+    )
     paper &= ~protected
 
     # Feather only outward into paper; never blur the underlying page image.
@@ -408,6 +514,10 @@ def process_image(image: Image.Image, mode: str) -> Image.Image:
     alpha = np.clip(alpha, 0.0, 1.0)[:, :, None]
     cleaned = np.rint(rgb.astype(np.float32) + alpha * (255.0 - rgb)).astype(np.uint8)
     cleaned[protected] = rgb[protected]
+    # Keep detected photos pixel-for-pixel except where the border detector
+    # has positively identified a physical scanner/page-edge strip.
+    restore_photo = photo_mask & ~border_changed
+    cleaned[restore_photo] = original_rgb[restore_photo]
     return Image.fromarray(cleaned, "RGB")
 
 
