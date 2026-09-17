@@ -27,7 +27,7 @@ from PIL import Image, ImageOps, PngImagePlugin
 from scipy import ndimage
 
 
-PROCESSOR_VERSION = "9-complete-photo-rectangle"
+PROCESSOR_VERSION = "10-punctuation-loop-protection"
 
 
 def select_pdfs_with_dialog() -> list[Path]:
@@ -362,7 +362,26 @@ def process_grayscale(image: Image.Image, mode: str) -> Image.Image:
     foreground_density = float(np.mean(component_mask))
     handwriting_stroke &= foreground_density < (0.035 if mode == "strong" else 0.060)
     large_gray = sizes >= (20000 if mode == "strong" else 12000)
-    keep_label = dark_content | handwriting_stroke | large_gray
+
+    # Chinese full stops (。), degree signs, circled marks, and similar small
+    # glyphs are closed loops with a white center.  Their thin antialiased ring
+    # may contain no very dark pixel, so a generic speck filter can otherwise
+    # mistake them for dust.  Detect enclosed holes topologically and preserve
+    # the complete small loop regardless of foreground density.
+    filled_foreground = ndimage.binary_fill_holes(component_mask)
+    enclosed_holes = filled_foreground & ~component_mask
+    hole_boundary = (
+        ndimage.binary_dilation(
+            enclosed_holes, structure=np.ones((3, 3), dtype=np.uint8)
+        )
+        & component_mask
+    )
+    loop_label = np.zeros(count + 1, dtype=bool)
+    loop_label[np.unique(labels[hole_boundary])] = True
+    loop_label[0] = False
+    typographic_loop = loop_label & (sizes >= 6) & (sizes <= 500)
+
+    keep_label = dark_content | handwriting_stroke | large_gray | typographic_loop
     keep_label[0] = False
     protected = keep_label[labels]
 
