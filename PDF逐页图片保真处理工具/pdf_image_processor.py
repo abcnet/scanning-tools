@@ -2,7 +2,7 @@
 """Extract PDF pages and create conservatively cleaned page images.
 
 Outputs beside input.pdf:
-  input/001.png, 002.png, ...
+  input/001.jpg, 002.jpg, ... (or the actual embedded image format)
   input-processed/001.png, 002.png, ...
 
 The processing is deterministic and non-generative. Dark text, colorful
@@ -18,6 +18,7 @@ import os
 import shlex
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import fitz  # PyMuPDF
@@ -584,7 +585,37 @@ def remove_other_page_images(directory: Path, stem: str, keep: Path) -> None:
             candidate.unlink()
 
 
-def process_pdf(pdf_path: Path, dpi: int, mode: str, overwrite: bool) -> None:
+def process_saved_page(
+    task: tuple[int, Path, Path, int, str, bool]
+) -> tuple[int, str]:
+    index, original_path, processed_path, dpi, mode, overwrite = task
+
+    if not valid_existing_png(original_path):
+        raise RuntimeError(f"原始页面图片无效或缺失：{original_path}")
+
+    source_sha256 = hashlib.sha256(original_path.read_bytes()).hexdigest()
+    if not overwrite and valid_existing_png(
+        processed_path, PROCESSOR_VERSION, source_sha256
+    ):
+        return index, "跳过"
+
+    with Image.open(original_path) as opened:
+        original = normalize_image(opened)
+        original.load()
+    processed = process_image(original, mode)
+    save_png(
+        processed,
+        processed_path,
+        dpi,
+        PROCESSOR_VERSION,
+        source_sha256,
+    )
+    return index, "处理"
+
+
+def process_pdf(
+    pdf_path: Path, dpi: int, mode: str, overwrite: bool, workers: int
+) -> None:
     pdf_path = pdf_path.expanduser().resolve()
     if not pdf_path.is_file() or pdf_path.suffix.lower() != ".pdf":
         raise FileNotFoundError(f"找不到 PDF：{pdf_path}")
@@ -639,42 +670,32 @@ def process_pdf(pdf_path: Path, dpi: int, mode: str, overwrite: bool) -> None:
             )
 
     # Do not begin cleanup until every source page has been saved.  Processing
-    # from the saved PNGs also makes the two stages independently resumable.
+    # from the saved images also makes the two stages independently resumable.
     print("\n全部原始页面已经保存。", flush=True)
-    print("阶段 2/2：依次处理已保存的页面", flush=True)
+    active_workers = min(workers, total)
+    print(
+        f"阶段 2/2：并行处理已保存的页面（{active_workers}个工作线程）",
+        flush=True,
+    )
 
-    for index in range(total):
-        stem = f"{index + 1:0{digits}d}"
-        original_path = original_paths[index]
-        processed_path = processed_dir / f"{stem}.png"
-
-        if not valid_existing_png(original_path):
-            raise RuntimeError(f"原始页面图片无效或缺失：{original_path}")
-
-        source_sha256 = hashlib.sha256(original_path.read_bytes()).hexdigest()
-
-        if overwrite or not valid_existing_png(
-            processed_path, PROCESSOR_VERSION, source_sha256
-        ):
-            with Image.open(original_path) as opened:
-                original = normalize_image(opened)
-                original.load()
-            processed = process_image(original, mode)
-            save_png(
-                processed,
-                processed_path,
-                dpi,
-                PROCESSOR_VERSION,
-                source_sha256,
-            )
-            processed_status = "处理"
-        else:
-            processed_status = "跳过"
-
-        print(
-            f"[处理 {index + 1:0{digits}d}/{total}] 处理图:{processed_status}",
-            flush=True,
+    tasks = [
+        (
+            index,
+            original_paths[index],
+            processed_dir / f"{index + 1:0{digits}d}.png",
+            dpi,
+            mode,
+            overwrite,
         )
+        for index in range(total)
+    ]
+    with ThreadPoolExecutor(max_workers=active_workers) as executor:
+        results = executor.map(process_saved_page, tasks)
+        for index, processed_status in results:
+            print(
+                f"[处理 {index + 1:0{digits}d}/{total}] 处理图:{processed_status}",
+                flush=True,
+            )
 
     print("\n完成。请先抽查文字、手写内容、灰色图形和黄色插图，再导入 Epson DCP。")
 
@@ -697,6 +718,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="覆盖已存在的逐页图片；默认跳过完整的现有页面，便于断点续跑",
     )
     parser.add_argument(
+        "--workers",
+        type=int,
+        default=min(4, max(1, os.cpu_count() or 1)),
+        help="并行处理图片的线程数，默认自动选择且最多4个；内存不足可设为1或2",
+    )
+    parser.add_argument(
         "--once",
         action="store_true",
         help="处理命令行中的文件后立即退出，不继续弹出选择窗口",
@@ -708,6 +735,9 @@ def main() -> int:
     args = build_parser().parse_args()
     if args.dpi < 72 or args.dpi > 1200:
         print("DPI 必须在72到1200之间。", file=sys.stderr)
+        return 2
+    if args.workers < 1 or args.workers > 32:
+        print("工作线程数必须在1到32之间。", file=sys.stderr)
         return 2
 
     pending = list(args.pdf)
@@ -729,7 +759,13 @@ def main() -> int:
             print("\n" + "=" * 72)
             print(f"批次文件 [{batch_index}/{len(pending)}]")
             try:
-                process_pdf(pdf_path, args.dpi, args.mode, args.overwrite)
+                process_pdf(
+                    pdf_path,
+                    args.dpi,
+                    args.mode,
+                    args.overwrite,
+                    args.workers,
+                )
             except Exception as exc:
                 had_error = True
                 print(f"错误：{exc}", file=sys.stderr)
