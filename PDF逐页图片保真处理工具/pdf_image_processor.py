@@ -739,7 +739,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--workers",
         type=int,
-        default=min(4, max(1, os.cpu_count() or 1)),
+        default=min(8, max(1, os.cpu_count() or 1)),
         help="并行处理图片的线程数，默认自动选择且最多4个；内存不足可设为1或2",
     )
     parser.add_argument(
