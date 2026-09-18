@@ -27,7 +27,7 @@ from PIL import Image, ImageOps, PngImagePlugin
 from scipy import ndimage
 
 
-PROCESSOR_VERSION = "14-separated-extraction-and-image-processing"
+PROCESSOR_VERSION = "22-contained-scanner-seam-crop"
 
 
 def select_pdfs_with_dialog() -> list[Path]:
@@ -123,6 +123,223 @@ def normalize_image(image: Image.Image) -> Image.Image:
     return rgb
 
 
+def detect_physical_crop_box(image: Image.Image) -> tuple[int, int, int, int]:
+    """Return a conservative rectangular crop for scanner-bed borders.
+
+    A side is cropped only when its outer strip is clearly darker than the
+    central paper and nearly every scan line finds a consistent transition to
+    bright paper near that same edge.  The inward high quantile removes a
+    slightly ragged/torn paper edge completely without creating a jagged crop.
+    """
+    rgb = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    gray = (
+        0.2126 * rgb[:, :, 0]
+        + 0.7152 * rgb[:, :, 1]
+        + 0.0722 * rgb[:, :, 2]
+    ).astype(np.float32)
+    height, width = gray.shape
+    if height < 200 or width < 200:
+        return 0, 0, width, height
+
+    center = gray[height // 5 : 4 * height // 5, width // 5 : 4 * width // 5]
+    paper = float(np.percentile(center, 70))
+    bright_cutoff = max(220.0, paper - 22.0)
+
+    def boundary_depth(lines: np.ndarray, maximum: int) -> tuple[int, int]:
+        # lines shape: scan lines x distance from the candidate outer edge.
+        outer_width = max(3, min(12, maximum // 8))
+        outer_by_line = np.median(lines[:, :outer_width], axis=1)
+        outer_median = float(np.median(outer_by_line))
+        full_edge = outer_median < paper - 16.0
+
+        # A scanner lid/bed strip can cover only part of one physical edge.
+        # Accept that case only when the darker outer samples form one long,
+        # flat, contiguous run.  Sparse text or isolated marks do not qualify.
+        active = outer_by_line < paper - 16.0
+        padded = np.pad(active.astype(np.int8), (1, 1))
+        changes = np.diff(padded)
+        starts = np.flatnonzero(changes == 1)
+        ends = np.flatnonzero(changes == -1)
+        longest_run = int(np.max(ends - starts)) if starts.size else 0
+        partial_edge = (
+            float(np.mean(active)) >= 0.30
+            and longest_run >= int(lines.shape[0] * 0.25)
+            and float(np.std(outer_by_line[active])) <= 10.0
+        )
+        if not full_edge and not partial_edge:
+            return 0, 0
+
+        selected_lines = lines if full_edge else lines[active]
+
+        smooth = ndimage.uniform_filter1d(
+            selected_lines.astype(np.float32), size=7, axis=1, mode="nearest"
+        )
+        bright = smooth >= bright_cutoff
+        sustained = ndimage.uniform_filter1d(
+            bright.astype(np.float32), size=13, axis=1, mode="constant"
+        ) >= 0.92
+
+        depths: list[int] = []
+        for row in sustained:
+            found = np.flatnonzero(row[:maximum])
+            if found.size:
+                depths.append(int(found[0]))
+        if len(depths) < int(selected_lines.shape[0] * 0.90):
+            return 0, 0
+
+        values = np.asarray(depths, dtype=np.float32)
+        # A genuine page edge stays in a narrow band. Content or shadows near
+        # an otherwise normal edge produce a much less consistent estimate.
+        if float(np.percentile(values, 95) - np.percentile(values, 5)) > maximum * 0.45:
+            return 0, 0
+        crop_depth = min(maximum, int(np.ceil(np.percentile(values, 99.5))) + 1)
+        # Nearly every scan line is still outside the paper before this
+        # conservative lower quantile.  Neutral marks ending wholly before it
+        # are scanner-bed seams, not writing on the page.
+        trusted_outer_depth = max(0, int(np.floor(np.percentile(values, 1))))
+        return crop_depth, trusted_outer_depth
+
+    y_margin = max(10, int(height * 0.01))
+    x_margin = max(10, int(width * 0.01))
+    vertical = gray[y_margin : height - y_margin, :]
+    horizontal = gray[:, x_margin : width - x_margin]
+    max_x = max(1, int(width * 0.14))
+    max_y = max(1, int(height * 0.10))
+
+    left, left_trusted = boundary_depth(vertical, max_x)
+    right_depth, right_trusted = boundary_depth(vertical[:, ::-1], max_x)
+    top, top_trusted = boundary_depth(horizontal.T, max_y)
+    bottom_depth, bottom_trusted = boundary_depth(horizontal[::-1, :].T, max_y)
+
+    def content_limited_depth(
+        strip: np.ndarray,
+        color_strip: np.ndarray,
+        inward_axis: int,
+        trusted_outer_depth: int,
+    ) -> int | None:
+        """Return a safe depth before dark or colored writing/artwork."""
+        if strip.size == 0:
+            return None
+        # A scanner-bed border may itself be gray.  Ink is identified by
+        # multiple connected strokes substantially darker than the paper;
+        # isolated dust pixels do not veto a useful crop.
+        ink_cutoff = min(170.0, paper - 55.0)
+        dark_ink = strip < ink_cutoff
+        color_i16 = color_strip.astype(np.int16)
+        chroma = np.max(color_i16, axis=2) - np.min(color_i16, axis=2)
+        # Red/blue/green annotations can be visually strong but relatively
+        # bright in grayscale.  Protect saturated strokes separately.
+        color_ink = (chroma >= 25) & (np.min(color_i16, axis=2) <= 225)
+        ink = dark_ink | color_ink
+        dark_evidence = float(np.mean(dark_ink)) >= 0.001
+        color_evidence = float(np.mean(color_ink)) >= 0.0003
+        if not dark_evidence and not color_evidence:
+            return None
+        labels, count = ndimage.label(ink)
+        if count == 0:
+            return None
+        sizes = np.bincount(labels.ravel())[1:]
+        significant = np.flatnonzero(sizes >= 15) + 1
+        objects = ndimage.find_objects(labels)
+
+        # A scanner-bed seam or the shadow under a curled page edge can form
+        # one dark component running almost the full width/height of the side
+        # being cropped.  It is part of the physical border, not handwriting.
+        # Ignore only components that both touch the outer edge and span most
+        # of the perpendicular dimension; ordinary writing, page numbers and
+        # colored annotations remain local and continue to limit the crop.
+        cross_axis = 1 - inward_axis
+        cross_extent = strip.shape[cross_axis]
+        outer_tolerance = max(8, int(strip.shape[inward_axis] * 0.12))
+        content_components: list[int] = []
+        for label_id in significant:
+            obj = objects[label_id - 1]
+            inward_slice = obj[inward_axis]
+            cross_slice = obj[cross_axis]
+            spans_side = (cross_slice.stop - cross_slice.start) >= 0.70 * cross_extent
+            touches_outer = inward_slice.start <= outer_tolerance
+            component = labels[obj] == label_id
+            component_color_share = float(np.mean(color_ink[obj][component]))
+            neutral_seam = component_color_share <= 0.05
+            # For a very shallow candidate strip, retain the old conservative
+            # behavior: a full-width rule may genuinely sit at the page edge.
+            # The seam exception is reserved for a substantial scanner-bed
+            # band such as the 98-pixel strip in the reported failure.
+            meaningful_border_depth = strip.shape[inward_axis] >= 40
+            contained_outside_paper = inward_slice.stop <= max(
+                0, trusted_outer_depth - 3
+            )
+            if neutral_seam and meaningful_border_depth and (
+                (spans_side and touches_outer) or contained_outside_paper
+            ):
+                continue
+            content_components.append(int(label_id))
+        significant = np.asarray(content_components, dtype=np.int32)
+        if significant.size == 0:
+            return None
+        # Several separate strokes identify ordinary text.  A single large
+        # connected component also matters: faint pencil notes can merge into
+        # only one to three detectable components at the strict dark cutoff.
+        content_sizes = sizes[significant - 1]
+        dark_strokes = dark_evidence and (
+            significant.size >= 4 or bool(np.any(content_sizes >= 200))
+        )
+        color_stroke = color_evidence and bool(np.any(content_sizes >= 20))
+        if not dark_strokes and not color_stroke:
+            return None
+        first = min(objects[label_id - 1][inward_axis].start for label_id in significant)
+        return max(0, int(first) - 4)
+
+    # Remove the pure scanner-bed portion, then stop just before page content.
+    # Far-side strips are reversed so index zero is always the outer edge.
+    if left:
+        limit = content_limited_depth(
+            gray[:, :left], rgb[:, :left], inward_axis=1,
+            trusted_outer_depth=left_trusted,
+        )
+        if limit is not None:
+            left = min(left, limit)
+    if right_depth:
+        limit = content_limited_depth(
+            gray[:, width - right_depth :][:, ::-1],
+            rgb[:, width - right_depth :][:, ::-1],
+            inward_axis=1,
+            trusted_outer_depth=right_trusted,
+        )
+        if limit is not None:
+            right_depth = min(right_depth, limit)
+    if top:
+        limit = content_limited_depth(
+            gray[:top, :], rgb[:top, :], inward_axis=0,
+            trusted_outer_depth=top_trusted,
+        )
+        if limit is not None:
+            top = min(top, limit)
+    if bottom_depth:
+        limit = content_limited_depth(
+            gray[height - bottom_depth :, :][::-1, :],
+            rgb[height - bottom_depth :, :][::-1, :],
+            inward_axis=0,
+            trusted_outer_depth=bottom_trusted,
+        )
+        if limit is not None:
+            bottom_depth = min(bottom_depth, limit)
+
+    right = width - right_depth
+    bottom = height - bottom_depth
+
+    if right - left < width * 0.70 or bottom - top < height * 0.75:
+        return 0, 0, width, height
+    return left, top, right, bottom
+
+
+def crop_physical_scanner_borders(image: Image.Image) -> Image.Image:
+    box = detect_physical_crop_box(image)
+    if box == (0, 0, image.width, image.height):
+        return image
+    return image.crop(box)
+
+
 def dominant_embedded_image_data(
     document: fitz.Document, page: fitz.Page
 ) -> tuple[bytes, str] | None:
@@ -177,17 +394,18 @@ def render_page_image(page: fitz.Page, dpi: int) -> Image.Image:
     return normalize_image(Image.frombytes("RGB", (pixmap.width, pixmap.height), pixmap.samples))
 
 
-def detect_photo_regions(
+def detect_visual_layout_regions(
     gray: np.ndarray, saturation: np.ndarray | None = None
 ) -> np.ndarray:
-    """Detect photographic blocks and protect their complete rectangular area.
+    """Detect photographs and structured layout panels as complete rectangles.
 
-    Text has many hard edges but little continuously varying midtone texture.
-    Photos normally contain both.  Color variation is additional evidence but
-    is not required, so monochrome photographs are protected as well.  Once a
-    sufficiently large photographic component is found, its bounding rectangle
-    is protected; this intentionally includes flat sky, walls, and other
-    low-texture backgrounds inside the photograph.
+    The same midtone/texture evidence that identifies photographs also appears
+    in designed text cards: avatars or icons, several text lines, dotted rules,
+    and a continuous pale rectangular fill.  Both are intentional page layout,
+    not paper dirt.  Once a sufficiently large visual component is found, its
+    complete bounding rectangle is protected.  This deliberately retains flat
+    sky and walls inside photos as well as gray/beige fills behind text blocks,
+    preventing cleanup from cutting white holes through a designed panel.
     """
     gray_f = gray.astype(np.float32)
     height, width = gray.shape
@@ -233,7 +451,7 @@ def detect_photo_regions(
     labels, count = ndimage.label(joined)
     objects = ndimage.find_objects(labels)
 
-    photo_mask = np.zeros(gray.shape, dtype=bool)
+    layout_mask = np.zeros(gray.shape, dtype=bool)
     min_area = max(2500, int(height * width * 0.00045))
     min_dimension = max(35, int(short_side * 0.025))
 
@@ -265,21 +483,22 @@ def detect_photo_regions(
         y1 = min(height, ys.stop + padding)
         x0 = max(0, xs.start - padding)
         x1 = min(width, xs.stop + padding)
-        photo_mask[y0:y1, x0:x1] = True
+        layout_mask[y0:y1, x0:x1] = True
 
-    return photo_mask
+    return layout_mask
 
 
-def grayscale_border_depths(gray: np.ndarray) -> tuple[int, int, int, int]:
-    """Return top, bottom, left and right scanner-border depths.
+def clean_grayscale_borders(gray: np.ndarray) -> np.ndarray:
+    """Whiten scanner-bed strips connected to an outer image edge.
 
     Some scanners include a 5-10 mm gray band beyond the paper plus a dark
     paper/bed boundary line. Detection starts at each outermost row/column and
     stops after several consecutive paper-like lines, so internal content and
     graphics near (but not touching) the edge are not treated as borders.
     """
-    height, width = gray.shape
-    center = gray[height // 4 : 3 * height // 4, width // 4 : 3 * width // 4]
+    result = gray.copy()
+    height, width = result.shape
+    center = result[height // 4 : 3 * height // 4, width // 4 : 3 * width // 4]
     paper = float(np.percentile(center, 70))
     bright_cutoff = max(210.0, paper - 17.0)
 
@@ -303,18 +522,10 @@ def grayscale_border_depths(gray: np.ndarray) -> tuple[int, int, int, int]:
 
     max_y = max(1, int(height * 0.06))
     max_x = max(1, int(width * 0.06))
-    top = strip_depth(gray, max_y)
-    bottom = strip_depth(gray[::-1, :], max_y)
-    left = strip_depth(gray.T, max_x)
-    right = strip_depth(gray[:, ::-1].T, max_x)
-    return top, bottom, left, right
-
-
-def clean_grayscale_borders(gray: np.ndarray) -> np.ndarray:
-    """Whiten detected scanner borders without changing the canvas size."""
-    result = gray.copy()
-    height, width = result.shape
-    top, bottom, left, right = grayscale_border_depths(result)
+    top = strip_depth(result, max_y)
+    bottom = strip_depth(result[::-1, :], max_y)
+    left = strip_depth(result.T, max_x)
+    right = strip_depth(result[:, ::-1].T, max_x)
 
     if top:
         result[:top, :] = 255
@@ -337,11 +548,7 @@ def process_grayscale(image: Image.Image, mode: str) -> Image.Image:
     software cannot introduce yellow/blue chroma speckles.
     """
     original = np.asarray(image.convert("L"), dtype=np.uint8)
-    top, bottom, left, right = grayscale_border_depths(original)
-    height, width = original.shape
-    if top or bottom or left or right:
-        original = original[top : height - bottom, left : width - right]
-    photo_mask = detect_photo_regions(original)
+    layout_mask = detect_visual_layout_regions(original)
     gray = clean_grayscale_borders(original)
     border_changed = gray != original
     result = gray.copy()
@@ -419,90 +626,59 @@ def process_grayscale(image: Image.Image, mode: str) -> Image.Image:
     # Scanner-bed strips and physical page borders have higher priority than
     # photo protection.  Otherwise a photo mask reaching an outer edge would
     # restore the gray/black strip that clean_grayscale_borders just removed.
-    restore_photo = photo_mask & ~border_changed
-    result[restore_photo] = original[restore_photo]
+    # Physical scanner borders have already been cropped before this stage.
+    # A confirmed layout region must now be restored unconditionally; later
+    # pixel cleanup may never punch holes through an intentional background.
+    restore_layout = layout_mask
+    result[restore_layout] = original[restore_layout]
     return Image.fromarray(result, "L")
 
 
-def uniform_border_depths(rgb: np.ndarray) -> tuple[int, int, int, int]:
-    """Return top, bottom, left and right neutral scanner-strip depths."""
-    height, width = rgb.shape[:2]
+def clean_uniform_borders(rgb: np.ndarray) -> np.ndarray:
+    """Whiten only narrow, nearly uniform neutral strips touching page edges."""
+    result = rgb.copy()
+    height, width = result.shape[:2]
     gray = (
-        0.2126 * rgb[:, :, 0]
-        + 0.7152 * rgb[:, :, 1]
-        + 0.0722 * rgb[:, :, 2]
+        0.2126 * result[:, :, 0]
+        + 0.7152 * result[:, :, 1]
+        + 0.0722 * result[:, :, 2]
     )
-    hsv = np.asarray(Image.fromarray(rgb, "RGB").convert("HSV"))
+    hsv = np.asarray(Image.fromarray(result, "RGB").convert("HSV"))
     saturation = hsv[:, :, 1]
 
     max_x = max(1, int(width * 0.04))
     max_y = max(1, int(height * 0.04))
 
-    def strip_depth(values: np.ndarray, sats: np.ndarray, max_depth: int) -> int:
-        """Find a neutral scanner strip despite a few damaged outer lines.
+    def neutral_uniform(values: np.ndarray, sats: np.ndarray) -> bool:
+        return float(np.std(values)) < 18.0 and float(np.median(sats)) < 48.0
 
-        JPEG ringing, a scanner lamp highlight, or a torn corner can make the
-        physical first row/column much less uniform than the rest of the same
-        border.  Requiring line zero to pass therefore leaves the whole strip
-        behind.  Robust percentiles ignore sparse outliers, and the short
-        look-ahead tolerates at most two anomalous outer lines.  A colored or
-        textured header still stops the scan immediately after the gray band.
-        """
-        values = values[:max_depth]
-        sats = sats[:max_depth]
-        p10 = np.percentile(values, 10, axis=1)
-        med = np.median(values, axis=1)
-        p90 = np.percentile(values, 90, axis=1)
-        sat_med = np.median(sats, axis=1)
-        candidate = (
-            ((p90 - p10) < 22.0)
-            & (sat_med < 48.0)
-            & (med < 246.0)
-        )
+    left = 0
+    for x in range(max_x):
+        if neutral_uniform(gray[:, x], saturation[:, x]):
+            left = x + 1
+        else:
+            break
 
-        # A real removable strip must be visible and must dominate the first
-        # few lines.  This prevents an isolated neutral line beside edge-touching
-        # artwork from starting border removal.
-        visible = med < 238.0
-        probe = min(5, len(candidate))
-        if probe == 0 or np.count_nonzero(candidate[:probe] & visible[:probe]) < 3:
-            return 0
+    right = width
+    for x in range(width - 1, width - max_x - 1, -1):
+        if neutral_uniform(gray[:, x], saturation[:, x]):
+            right = x
+        else:
+            break
 
-        last_good = -1
-        misses = 0
-        for index, is_candidate in enumerate(candidate):
-            if is_candidate:
-                last_good = index
-                misses = 0
-            else:
-                misses += 1
-                if misses >= 2:
-                    break
-        depth = last_good + 1
-        # A scanner border can blend gradually into edge-touching colored
-        # artwork over a few antialiased rows.  Do not leave that gray/color
-        # transition behind: advance to the first unmistakably saturated
-        # content line, while preserving that line itself.
-        transition_limit = min(len(candidate), depth + 8)
-        for index in range(depth, transition_limit):
-            if sat_med[index] >= 160.0:
-                return index
-        return depth
+    top = 0
+    for y in range(max_y):
+        if neutral_uniform(gray[y, :], saturation[y, :]):
+            top = y + 1
+        else:
+            break
 
-    left = strip_depth(gray.T, saturation.T, max_x)
-    right_depth = strip_depth(gray[:, ::-1].T, saturation[:, ::-1].T, max_x)
-    top = strip_depth(gray, saturation, max_y)
-    bottom_depth = strip_depth(gray[::-1, :], saturation[::-1, :], max_y)
-    return top, bottom_depth, left, right_depth
-
-
-def clean_uniform_borders(rgb: np.ndarray) -> np.ndarray:
-    """Whiten detected scanner borders without changing the canvas size."""
-    result = rgb.copy()
-    height, width = result.shape[:2]
-    top, bottom_depth, left, right_depth = uniform_border_depths(result)
-    right = width - right_depth
-    bottom = height - bottom_depth
+    bottom = height
+    for y in range(height - 1, height - max_y - 1, -1):
+        if neutral_uniform(gray[y, :], saturation[y, :]):
+            bottom = y
+        else:
+            break
 
     if left:
         result[:, :left] = 255
@@ -515,24 +691,66 @@ def clean_uniform_borders(rgb: np.ndarray) -> np.ndarray:
     return result
 
 
+def detect_aged_paper_stains(
+    rgb: np.ndarray, gray: np.ndarray, saturation: np.ndarray
+) -> tuple[np.ndarray, bool]:
+    """Find widespread yellow-brown aging on otherwise document-like pages.
+
+    A few yellow objects must not switch on this cleanup.  The rule therefore
+    activates only when warm paper-colored pixels cover a substantial part of
+    the page and dark content occupies a document-like minority.  The returned
+    mask deliberately includes textured foxing and broad edge stains; those
+    are exactly the regions that the normal flat-paper test cannot remove.
+    """
+    work = rgb.astype(np.int16)
+    red = work[:, :, 0]
+    green = work[:, :, 1]
+    blue = work[:, :, 2]
+
+    warm = (
+        (red - green >= 3)
+        & (green - blue >= 3)
+        & (red - blue >= 12)
+        & (saturation >= 8)
+        & (gray >= 95.0)
+    )
+    warm_share = float(np.mean(warm))
+    dark_share = float(np.mean(gray < 175.0))
+    active = warm_share >= 0.12 and dark_share <= 0.16
+    if not active:
+        return np.zeros(gray.shape, dtype=bool), False
+
+    # Include the pale fringe around brown foxing without crossing into
+    # neutral gray/black document strokes.
+    pale_warm = (
+        (red - green >= 2)
+        & (green - blue >= 2)
+        & (red - blue >= 8)
+        & (saturation >= 5)
+        & (gray >= 105.0)
+    )
+    stain = ndimage.binary_dilation(warm, iterations=1) & pale_warm
+    stain |= warm
+    return stain, True
+
+
 def process_image(image: Image.Image, mode: str) -> Image.Image:
     """Whiten high-confidence paper background without generating details."""
     image = normalize_image(image)
+    image = crop_physical_scanner_borders(image)
     if image.mode == "L":
         return process_grayscale(image, mode)
 
     original_rgb = np.asarray(image, dtype=np.uint8)
-    top, bottom, left, right = uniform_border_depths(original_rgb)
-    height, width = original_rgb.shape[:2]
-    if top or bottom or left or right:
-        original_rgb = original_rgb[top : height - bottom, left : width - right]
     original_hsv = np.asarray(Image.fromarray(original_rgb, "RGB").convert("HSV"))
     original_gray = (
         0.2126 * original_rgb[:, :, 0]
         + 0.7152 * original_rgb[:, :, 1]
         + 0.0722 * original_rgb[:, :, 2]
     ).astype(np.float32)
-    photo_mask = detect_photo_regions(original_gray, original_hsv[:, :, 1])
+    layout_mask = detect_visual_layout_regions(
+        original_gray, original_hsv[:, :, 1]
+    )
 
     rgb = clean_uniform_borders(original_rgb)
     border_changed = np.any(rgb != original_rgb, axis=2)
@@ -544,6 +762,60 @@ def process_image(image: Image.Image, mode: str) -> Image.Image:
         + 0.7152 * rgb[:, :, 1]
         + 0.0722 * rgb[:, :, 2]
     ).astype(np.float32)
+
+    # Decide whether this is an aged page from the untouched scan.  Running
+    # this after border cleanup can push a borderline page just below the
+    # activation threshold and incorrectly disable broad-stain removal.
+    stain_mask, aged_page = detect_aged_paper_stains(
+        original_rgb, original_gray, original_hsv[:, :, 1].astype(np.float32)
+    )
+    if aged_page and np.any(layout_mask):
+        # Foxing can form one textured, page-sized false "photograph".  Drop
+        # only huge edge-touching photo components; genuine smaller embedded
+        # photographs remain protected.
+        labels, count = ndimage.label(layout_mask)
+        sizes = np.bincount(labels.ravel(), minlength=count + 1)
+        edge_labels = np.unique(
+            np.concatenate((labels[0, :], labels[-1, :], labels[:, 0], labels[:, -1]))
+        )
+        false_photo = np.zeros(count + 1, dtype=bool)
+        false_photo[edge_labels] = sizes[edge_labels] >= int(gray.size * 0.30)
+        stain_overlap = ndimage.sum(stain_mask, labels, range(count + 1))
+        false_photo |= stain_overlap >= np.maximum(1, sizes * 0.12)
+
+        # Aged beige/gray text panels overlap the warm-stain mask by design.
+        # Exempt compact, wide rectangles containing substantial dark text;
+        # irregular page-edge foxing lacks this geometry/content combination.
+        objects = ndimage.find_objects(labels)
+        structured_panel = np.zeros(count + 1, dtype=bool)
+        for label_id, bounds in enumerate(objects, 1):
+            if bounds is None:
+                continue
+            ys, xs = bounds
+            box_height = ys.stop - ys.start
+            box_width = xs.stop - xs.start
+            box_area = box_height * box_width
+            area_share = box_area / max(gray.size, 1)
+            aspect = box_width / max(box_height, 1)
+            fill = sizes[label_id] / max(box_area, 1)
+            dark_share = float(np.mean(gray[ys, xs] < 190.0))
+            touches_edge = (
+                ys.start == 0
+                or xs.start == 0
+                or ys.stop == gray.shape[0]
+                or xs.stop == gray.shape[1]
+            )
+            if (
+                not touches_edge
+                and 0.005 <= area_share <= 0.20
+                and aspect >= 2.5
+                and fill >= 0.70
+                and 0.04 <= dark_share <= 0.40
+            ):
+                structured_panel[label_id] = True
+        false_photo &= ~structured_panel
+        false_photo[0] = False
+        layout_mask &= ~false_photo[labels]
 
     # Local texture and edge density separate paper from photos and drawings.
     local_mean = ndimage.uniform_filter(gray, size=31, mode="nearest")
@@ -573,16 +845,36 @@ def process_image(image: Image.Image, mode: str) -> Image.Image:
         (saturation > 45.0).astype(np.float32), size=61, mode="nearest"
     )
     color_region = ndimage.binary_dilation(color_density > 0.055, iterations=5)
+    if aged_page:
+        color_region &= ~ndimage.binary_dilation(stain_mask, iterations=2)
 
     # Protect original text strokes, gray graphics, colored content and their
     # immediate antialiased edges. Protected pixels are copied unchanged.
     protected_seed = (gray < 205.0) | (saturation > 70.0) | (gradient > 28.0)
+    if aged_page:
+        # Dark neutral cores anchor printed text, dotted rules and gray logos.
+        # Preserve their antialiased surroundings even where JPEG blending
+        # gives an edge pixel a slight warm cast.  Warm stain fragments alone
+        # are not allowed to become protected content.
+        document_core = gray < 205.0
+        non_warm_color = (saturation > 70.0) & ~stain_mask
+        document_content = ndimage.binary_dilation(
+            document_core | non_warm_color, iterations=2
+        )
+        protected_seed &= ~(stain_mask & (gray >= 205.0))
     protected = (
         ndimage.binary_dilation(protected_seed, iterations=2)
         | color_region
-        | photo_mask
+        | layout_mask
     )
+    if aged_page:
+        protected |= document_content
     paper &= ~protected
+
+    if aged_page:
+        # Widespread foxing is paper damage even when it is textured or fairly
+        # dark, so it bypasses the ordinary flat-background requirement.
+        paper |= stain_mask & ~protected
 
     # Feather only outward into paper; never blur the underlying page image.
     alpha = ndimage.gaussian_filter(paper.astype(np.float32), sigma=0.8)
@@ -592,8 +884,10 @@ def process_image(image: Image.Image, mode: str) -> Image.Image:
     cleaned[protected] = rgb[protected]
     # Keep detected photos pixel-for-pixel except where the border detector
     # has positively identified a physical scanner/page-edge strip.
-    restore_photo = photo_mask & ~border_changed
-    cleaned[restore_photo] = original_rgb[restore_photo]
+    # Cropping owns physical-border removal. Confirmed layout has the final
+    # word over whitening and stain cleanup, including its complete backdrop.
+    restore_layout = layout_mask & ~border_changed
+    cleaned[restore_layout] = original_rgb[restore_layout]
     return Image.fromarray(cleaned, "RGB")
 
 
@@ -658,31 +952,6 @@ def process_saved_page(
 ) -> tuple[int, str]:
     index, original_path, processed_path, dpi, mode, overwrite = task
 
-    return index, process_image_file(
-        original_path, processed_path, dpi, mode, overwrite
-    )
-
-
-def process_image_file(
-    original_path: Path | str,
-    processed_path: Path | str,
-    dpi: int = 300,
-    mode: str = "strong",
-    overwrite: bool = False,
-) -> str:
-    """Process one existing image without opening or constructing a PDF.
-
-    This is the independent entry point for testing and using all image-only
-    logic: border cropping, background cleanup, photo protection, handwriting
-    protection, and punctuation protection.  It intentionally has no PDF or
-    PyMuPDF dependency in its execution path.
-
-    Returns ``"处理"`` when a PNG is written and ``"跳过"`` when a current,
-    matching result already exists.
-    """
-    original_path = Path(original_path).expanduser().resolve()
-    processed_path = Path(processed_path).expanduser().resolve()
-
     if not valid_existing_png(original_path):
         raise RuntimeError(f"原始页面图片无效或缺失：{original_path}")
 
@@ -690,7 +959,7 @@ def process_image_file(
     if not overwrite and valid_existing_png(
         processed_path, PROCESSOR_VERSION, source_sha256
     ):
-        return "跳过"
+        return index, "跳过"
 
     with Image.open(original_path) as opened:
         original = normalize_image(opened)
@@ -703,26 +972,21 @@ def process_image_file(
         PROCESSOR_VERSION,
         source_sha256,
     )
-    return "处理"
+    return index, "处理"
 
 
-def extract_pdf_images(
-    pdf_path: Path | str,
-    dpi: int = 300,
-    overwrite: bool = False,
-) -> tuple[list[Path], int, Path]:
-    """Extract every PDF page image and stop before any image processing.
-
-    Dominant embedded raster streams are copied byte-for-byte.  Pages that
-    cannot be represented by one dominant image are rendered to PNG.  The
-    returned paths can be passed directly to :func:`process_image_file`.
-    """
-    pdf_path = Path(pdf_path).expanduser().resolve()
+def process_pdf(
+    pdf_path: Path, dpi: int, mode: str, overwrite: bool, workers: int
+) -> None:
+    pdf_path = pdf_path.expanduser().resolve()
     if not pdf_path.is_file() or pdf_path.suffix.lower() != ".pdf":
         raise FileNotFoundError(f"找不到 PDF：{pdf_path}")
 
     original_dir = pdf_path.with_suffix("")
+    processed_dir = pdf_path.parent / f"{pdf_path.stem}-processed"
     original_dir.mkdir(exist_ok=True)
+    processed_dir.mkdir(exist_ok=True)
+
     original_paths: list[Path] = []
 
     with fitz.open(pdf_path) as document:
@@ -731,7 +995,13 @@ def extract_pdf_images(
             raise RuntimeError("PDF 没有页面。")
         digits = max(3, len(str(total)))
 
+        print(f"PDF：{pdf_path}")
+        print(f"页数：{total}")
+        print(f"原始图片：{original_dir}")
+        print(f"处理图片：{processed_dir}")
+        print(f"模式：{mode}\n")
         print("阶段 1/2：提取并保存全部原始页面", flush=True)
+
         for index, page in enumerate(document):
             stem = f"{index + 1:0{digits}d}"
             embedded = dominant_embedded_image_data(document, page)
@@ -739,11 +1009,7 @@ def extract_pdf_images(
             if embedded is not None:
                 payload, extension = embedded
                 original_path = original_dir / f"{stem}.{extension}"
-                if (
-                    overwrite
-                    or not original_path.is_file()
-                    or original_path.read_bytes() != payload
-                ):
+                if overwrite or not original_path.is_file() or original_path.read_bytes() != payload:
                     original_path.write_bytes(payload)
                     original_status = f"原始流({extension})"
                 else:
@@ -759,28 +1025,15 @@ def extract_pdf_images(
 
             remove_other_page_images(original_dir, stem, original_path)
             original_paths.append(original_path)
+
             print(
                 f"[提取 {index + 1:0{digits}d}/{total}] 原图:{original_status}",
                 flush=True,
             )
 
-    return original_paths, digits, original_dir
-
-
-def process_image_files(
-    original_paths: list[Path],
-    processed_dir: Path,
-    dpi: int,
-    mode: str,
-    overwrite: bool,
-    workers: int,
-    digits: int,
-) -> None:
-    """Process an already-extracted image sequence without accessing a PDF."""
-    total = len(original_paths)
-    if total == 0:
-        raise RuntimeError("没有可处理的图片。")
-    processed_dir.mkdir(exist_ok=True)
+    # Do not begin cleanup until every source page has been saved.  Processing
+    # from the saved images also makes the two stages independently resumable.
+    print("\n全部原始页面已经保存。", flush=True)
     active_workers = min(workers, total)
     print(
         f"阶段 2/2：并行处理已保存的页面（{active_workers}个工作线程）",
@@ -790,13 +1043,13 @@ def process_image_files(
     tasks = [
         (
             index,
-            original_path,
+            original_paths[index],
             processed_dir / f"{index + 1:0{digits}d}.png",
             dpi,
             mode,
             overwrite,
         )
-        for index, original_path in enumerate(original_paths)
+        for index in range(total)
     ]
     with ThreadPoolExecutor(max_workers=active_workers) as executor:
         results = executor.map(process_saved_page, tasks)
@@ -805,35 +1058,6 @@ def process_image_files(
                 f"[处理 {index + 1:0{digits}d}/{total}] 处理图:{processed_status}",
                 flush=True,
             )
-
-
-def process_pdf(
-    pdf_path: Path, dpi: int, mode: str, overwrite: bool, workers: int
-) -> None:
-    pdf_path = pdf_path.expanduser().resolve()
-    if not pdf_path.is_file() or pdf_path.suffix.lower() != ".pdf":
-        raise FileNotFoundError(f"找不到 PDF：{pdf_path}")
-
-    processed_dir = pdf_path.parent / f"{pdf_path.stem}-processed"
-    processed_dir.mkdir(exist_ok=True)
-    with fitz.open(pdf_path) as document:
-        total = document.page_count
-    print(f"PDF：{pdf_path}")
-    print(f"页数：{total}")
-    print(f"原始图片：{pdf_path.with_suffix('')}")
-    print(f"处理图片：{processed_dir}")
-    print(f"模式：{mode}\n")
-
-    original_paths, digits, _original_dir = extract_pdf_images(
-        pdf_path, dpi, overwrite
-    )
-
-    # Do not begin cleanup until every source page has been saved.  Processing
-    # from the saved images also makes the two stages independently resumable.
-    print("\n全部原始页面已经保存。", flush=True)
-    process_image_files(
-        original_paths, processed_dir, dpi, mode, overwrite, workers, digits
-    )
 
     print("\n完成。请先抽查文字、手写内容、灰色图形和黄色插图，再导入 Epson DCP。")
 
