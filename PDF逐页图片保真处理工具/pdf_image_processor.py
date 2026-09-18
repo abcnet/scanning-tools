@@ -27,7 +27,7 @@ from PIL import Image, ImageOps, PngImagePlugin
 from scipy import ndimage
 
 
-PROCESSOR_VERSION = "13-complete-border-transition-cropping"
+PROCESSOR_VERSION = "14-separated-extraction-and-image-processing"
 
 
 def select_pdfs_with_dialog() -> list[Path]:
@@ -658,6 +658,31 @@ def process_saved_page(
 ) -> tuple[int, str]:
     index, original_path, processed_path, dpi, mode, overwrite = task
 
+    return index, process_image_file(
+        original_path, processed_path, dpi, mode, overwrite
+    )
+
+
+def process_image_file(
+    original_path: Path | str,
+    processed_path: Path | str,
+    dpi: int = 300,
+    mode: str = "strong",
+    overwrite: bool = False,
+) -> str:
+    """Process one existing image without opening or constructing a PDF.
+
+    This is the independent entry point for testing and using all image-only
+    logic: border cropping, background cleanup, photo protection, handwriting
+    protection, and punctuation protection.  It intentionally has no PDF or
+    PyMuPDF dependency in its execution path.
+
+    Returns ``"处理"`` when a PNG is written and ``"跳过"`` when a current,
+    matching result already exists.
+    """
+    original_path = Path(original_path).expanduser().resolve()
+    processed_path = Path(processed_path).expanduser().resolve()
+
     if not valid_existing_png(original_path):
         raise RuntimeError(f"原始页面图片无效或缺失：{original_path}")
 
@@ -665,7 +690,7 @@ def process_saved_page(
     if not overwrite and valid_existing_png(
         processed_path, PROCESSOR_VERSION, source_sha256
     ):
-        return index, "跳过"
+        return "跳过"
 
     with Image.open(original_path) as opened:
         original = normalize_image(opened)
@@ -678,21 +703,26 @@ def process_saved_page(
         PROCESSOR_VERSION,
         source_sha256,
     )
-    return index, "处理"
+    return "处理"
 
 
-def process_pdf(
-    pdf_path: Path, dpi: int, mode: str, overwrite: bool, workers: int
-) -> None:
-    pdf_path = pdf_path.expanduser().resolve()
+def extract_pdf_images(
+    pdf_path: Path | str,
+    dpi: int = 300,
+    overwrite: bool = False,
+) -> tuple[list[Path], int, Path]:
+    """Extract every PDF page image and stop before any image processing.
+
+    Dominant embedded raster streams are copied byte-for-byte.  Pages that
+    cannot be represented by one dominant image are rendered to PNG.  The
+    returned paths can be passed directly to :func:`process_image_file`.
+    """
+    pdf_path = Path(pdf_path).expanduser().resolve()
     if not pdf_path.is_file() or pdf_path.suffix.lower() != ".pdf":
         raise FileNotFoundError(f"找不到 PDF：{pdf_path}")
 
     original_dir = pdf_path.with_suffix("")
-    processed_dir = pdf_path.parent / f"{pdf_path.stem}-processed"
     original_dir.mkdir(exist_ok=True)
-    processed_dir.mkdir(exist_ok=True)
-
     original_paths: list[Path] = []
 
     with fitz.open(pdf_path) as document:
@@ -701,13 +731,7 @@ def process_pdf(
             raise RuntimeError("PDF 没有页面。")
         digits = max(3, len(str(total)))
 
-        print(f"PDF：{pdf_path}")
-        print(f"页数：{total}")
-        print(f"原始图片：{original_dir}")
-        print(f"处理图片：{processed_dir}")
-        print(f"模式：{mode}\n")
         print("阶段 1/2：提取并保存全部原始页面", flush=True)
-
         for index, page in enumerate(document):
             stem = f"{index + 1:0{digits}d}"
             embedded = dominant_embedded_image_data(document, page)
@@ -715,7 +739,11 @@ def process_pdf(
             if embedded is not None:
                 payload, extension = embedded
                 original_path = original_dir / f"{stem}.{extension}"
-                if overwrite or not original_path.is_file() or original_path.read_bytes() != payload:
+                if (
+                    overwrite
+                    or not original_path.is_file()
+                    or original_path.read_bytes() != payload
+                ):
                     original_path.write_bytes(payload)
                     original_status = f"原始流({extension})"
                 else:
@@ -731,15 +759,28 @@ def process_pdf(
 
             remove_other_page_images(original_dir, stem, original_path)
             original_paths.append(original_path)
-
             print(
                 f"[提取 {index + 1:0{digits}d}/{total}] 原图:{original_status}",
                 flush=True,
             )
 
-    # Do not begin cleanup until every source page has been saved.  Processing
-    # from the saved images also makes the two stages independently resumable.
-    print("\n全部原始页面已经保存。", flush=True)
+    return original_paths, digits, original_dir
+
+
+def process_image_files(
+    original_paths: list[Path],
+    processed_dir: Path,
+    dpi: int,
+    mode: str,
+    overwrite: bool,
+    workers: int,
+    digits: int,
+) -> None:
+    """Process an already-extracted image sequence without accessing a PDF."""
+    total = len(original_paths)
+    if total == 0:
+        raise RuntimeError("没有可处理的图片。")
+    processed_dir.mkdir(exist_ok=True)
     active_workers = min(workers, total)
     print(
         f"阶段 2/2：并行处理已保存的页面（{active_workers}个工作线程）",
@@ -749,13 +790,13 @@ def process_pdf(
     tasks = [
         (
             index,
-            original_paths[index],
+            original_path,
             processed_dir / f"{index + 1:0{digits}d}.png",
             dpi,
             mode,
             overwrite,
         )
-        for index in range(total)
+        for index, original_path in enumerate(original_paths)
     ]
     with ThreadPoolExecutor(max_workers=active_workers) as executor:
         results = executor.map(process_saved_page, tasks)
@@ -764,6 +805,35 @@ def process_pdf(
                 f"[处理 {index + 1:0{digits}d}/{total}] 处理图:{processed_status}",
                 flush=True,
             )
+
+
+def process_pdf(
+    pdf_path: Path, dpi: int, mode: str, overwrite: bool, workers: int
+) -> None:
+    pdf_path = pdf_path.expanduser().resolve()
+    if not pdf_path.is_file() or pdf_path.suffix.lower() != ".pdf":
+        raise FileNotFoundError(f"找不到 PDF：{pdf_path}")
+
+    processed_dir = pdf_path.parent / f"{pdf_path.stem}-processed"
+    processed_dir.mkdir(exist_ok=True)
+    with fitz.open(pdf_path) as document:
+        total = document.page_count
+    print(f"PDF：{pdf_path}")
+    print(f"页数：{total}")
+    print(f"原始图片：{pdf_path.with_suffix('')}")
+    print(f"处理图片：{processed_dir}")
+    print(f"模式：{mode}\n")
+
+    original_paths, digits, _original_dir = extract_pdf_images(
+        pdf_path, dpi, overwrite
+    )
+
+    # Do not begin cleanup until every source page has been saved.  Processing
+    # from the saved images also makes the two stages independently resumable.
+    print("\n全部原始页面已经保存。", flush=True)
+    process_image_files(
+        original_paths, processed_dir, dpi, mode, overwrite, workers, digits
+    )
 
     print("\n完成。请先抽查文字、手写内容、灰色图形和黄色插图，再导入 Epson DCP。")
 
