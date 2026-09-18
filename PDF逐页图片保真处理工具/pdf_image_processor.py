@@ -27,7 +27,7 @@ from PIL import Image, ImageOps, PngImagePlugin
 from scipy import ndimage
 
 
-PROCESSOR_VERSION = "10-punctuation-loop-protection"
+PROCESSOR_VERSION = "13-complete-border-transition-cropping"
 
 
 def select_pdfs_with_dialog() -> list[Path]:
@@ -270,17 +270,16 @@ def detect_photo_regions(
     return photo_mask
 
 
-def clean_grayscale_borders(gray: np.ndarray) -> np.ndarray:
-    """Whiten scanner-bed strips connected to an outer image edge.
+def grayscale_border_depths(gray: np.ndarray) -> tuple[int, int, int, int]:
+    """Return top, bottom, left and right scanner-border depths.
 
     Some scanners include a 5-10 mm gray band beyond the paper plus a dark
     paper/bed boundary line. Detection starts at each outermost row/column and
     stops after several consecutive paper-like lines, so internal content and
     graphics near (but not touching) the edge are not treated as borders.
     """
-    result = gray.copy()
-    height, width = result.shape
-    center = result[height // 4 : 3 * height // 4, width // 4 : 3 * width // 4]
+    height, width = gray.shape
+    center = gray[height // 4 : 3 * height // 4, width // 4 : 3 * width // 4]
     paper = float(np.percentile(center, 70))
     bright_cutoff = max(210.0, paper - 17.0)
 
@@ -304,10 +303,18 @@ def clean_grayscale_borders(gray: np.ndarray) -> np.ndarray:
 
     max_y = max(1, int(height * 0.06))
     max_x = max(1, int(width * 0.06))
-    top = strip_depth(result, max_y)
-    bottom = strip_depth(result[::-1, :], max_y)
-    left = strip_depth(result.T, max_x)
-    right = strip_depth(result[:, ::-1].T, max_x)
+    top = strip_depth(gray, max_y)
+    bottom = strip_depth(gray[::-1, :], max_y)
+    left = strip_depth(gray.T, max_x)
+    right = strip_depth(gray[:, ::-1].T, max_x)
+    return top, bottom, left, right
+
+
+def clean_grayscale_borders(gray: np.ndarray) -> np.ndarray:
+    """Whiten detected scanner borders without changing the canvas size."""
+    result = gray.copy()
+    height, width = result.shape
+    top, bottom, left, right = grayscale_border_depths(result)
 
     if top:
         result[:top, :] = 255
@@ -330,6 +337,10 @@ def process_grayscale(image: Image.Image, mode: str) -> Image.Image:
     software cannot introduce yellow/blue chroma speckles.
     """
     original = np.asarray(image.convert("L"), dtype=np.uint8)
+    top, bottom, left, right = grayscale_border_depths(original)
+    height, width = original.shape
+    if top or bottom or left or right:
+        original = original[top : height - bottom, left : width - right]
     photo_mask = detect_photo_regions(original)
     gray = clean_grayscale_borders(original)
     border_changed = gray != original
@@ -413,51 +424,85 @@ def process_grayscale(image: Image.Image, mode: str) -> Image.Image:
     return Image.fromarray(result, "L")
 
 
-def clean_uniform_borders(rgb: np.ndarray) -> np.ndarray:
-    """Whiten only narrow, nearly uniform neutral strips touching page edges."""
-    result = rgb.copy()
-    height, width = result.shape[:2]
+def uniform_border_depths(rgb: np.ndarray) -> tuple[int, int, int, int]:
+    """Return top, bottom, left and right neutral scanner-strip depths."""
+    height, width = rgb.shape[:2]
     gray = (
-        0.2126 * result[:, :, 0]
-        + 0.7152 * result[:, :, 1]
-        + 0.0722 * result[:, :, 2]
+        0.2126 * rgb[:, :, 0]
+        + 0.7152 * rgb[:, :, 1]
+        + 0.0722 * rgb[:, :, 2]
     )
-    hsv = np.asarray(Image.fromarray(result, "RGB").convert("HSV"))
+    hsv = np.asarray(Image.fromarray(rgb, "RGB").convert("HSV"))
     saturation = hsv[:, :, 1]
 
     max_x = max(1, int(width * 0.04))
     max_y = max(1, int(height * 0.04))
 
-    def neutral_uniform(values: np.ndarray, sats: np.ndarray) -> bool:
-        return float(np.std(values)) < 18.0 and float(np.median(sats)) < 48.0
+    def strip_depth(values: np.ndarray, sats: np.ndarray, max_depth: int) -> int:
+        """Find a neutral scanner strip despite a few damaged outer lines.
 
-    left = 0
-    for x in range(max_x):
-        if neutral_uniform(gray[:, x], saturation[:, x]):
-            left = x + 1
-        else:
-            break
+        JPEG ringing, a scanner lamp highlight, or a torn corner can make the
+        physical first row/column much less uniform than the rest of the same
+        border.  Requiring line zero to pass therefore leaves the whole strip
+        behind.  Robust percentiles ignore sparse outliers, and the short
+        look-ahead tolerates at most two anomalous outer lines.  A colored or
+        textured header still stops the scan immediately after the gray band.
+        """
+        values = values[:max_depth]
+        sats = sats[:max_depth]
+        p10 = np.percentile(values, 10, axis=1)
+        med = np.median(values, axis=1)
+        p90 = np.percentile(values, 90, axis=1)
+        sat_med = np.median(sats, axis=1)
+        candidate = (
+            ((p90 - p10) < 22.0)
+            & (sat_med < 48.0)
+            & (med < 246.0)
+        )
 
-    right = width
-    for x in range(width - 1, width - max_x - 1, -1):
-        if neutral_uniform(gray[:, x], saturation[:, x]):
-            right = x
-        else:
-            break
+        # A real removable strip must be visible and must dominate the first
+        # few lines.  This prevents an isolated neutral line beside edge-touching
+        # artwork from starting border removal.
+        visible = med < 238.0
+        probe = min(5, len(candidate))
+        if probe == 0 or np.count_nonzero(candidate[:probe] & visible[:probe]) < 3:
+            return 0
 
-    top = 0
-    for y in range(max_y):
-        if neutral_uniform(gray[y, :], saturation[y, :]):
-            top = y + 1
-        else:
-            break
+        last_good = -1
+        misses = 0
+        for index, is_candidate in enumerate(candidate):
+            if is_candidate:
+                last_good = index
+                misses = 0
+            else:
+                misses += 1
+                if misses >= 2:
+                    break
+        depth = last_good + 1
+        # A scanner border can blend gradually into edge-touching colored
+        # artwork over a few antialiased rows.  Do not leave that gray/color
+        # transition behind: advance to the first unmistakably saturated
+        # content line, while preserving that line itself.
+        transition_limit = min(len(candidate), depth + 8)
+        for index in range(depth, transition_limit):
+            if sat_med[index] >= 160.0:
+                return index
+        return depth
 
-    bottom = height
-    for y in range(height - 1, height - max_y - 1, -1):
-        if neutral_uniform(gray[y, :], saturation[y, :]):
-            bottom = y
-        else:
-            break
+    left = strip_depth(gray.T, saturation.T, max_x)
+    right_depth = strip_depth(gray[:, ::-1].T, saturation[:, ::-1].T, max_x)
+    top = strip_depth(gray, saturation, max_y)
+    bottom_depth = strip_depth(gray[::-1, :], saturation[::-1, :], max_y)
+    return top, bottom_depth, left, right_depth
+
+
+def clean_uniform_borders(rgb: np.ndarray) -> np.ndarray:
+    """Whiten detected scanner borders without changing the canvas size."""
+    result = rgb.copy()
+    height, width = result.shape[:2]
+    top, bottom_depth, left, right_depth = uniform_border_depths(result)
+    right = width - right_depth
+    bottom = height - bottom_depth
 
     if left:
         result[:, :left] = 255
@@ -477,6 +522,10 @@ def process_image(image: Image.Image, mode: str) -> Image.Image:
         return process_grayscale(image, mode)
 
     original_rgb = np.asarray(image, dtype=np.uint8)
+    top, bottom, left, right = uniform_border_depths(original_rgb)
+    height, width = original_rgb.shape[:2]
+    if top or bottom or left or right:
+        original_rgb = original_rgb[top : height - bottom, left : width - right]
     original_hsv = np.asarray(Image.fromarray(original_rgb, "RGB").convert("HSV"))
     original_gray = (
         0.2126 * original_rgb[:, :, 0]
@@ -740,7 +789,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--workers",
         type=int,
         default=min(8, max(1, os.cpu_count() or 1)),
-        help="并行处理图片的线程数，默认自动选择且最多4个；内存不足可设为1或2",
+        help="并行处理图片的线程数，默认自动选择且最多8个；内存不足可设为1、2或4",
     )
     parser.add_argument(
         "--once",
