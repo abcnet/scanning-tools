@@ -16,8 +16,10 @@ import argparse
 import hashlib
 import os
 import shlex
+import struct
 import subprocess
 import sys
+import zlib
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -27,7 +29,7 @@ from PIL import Image, ImageOps, PngImagePlugin
 from scipy import ndimage
 
 
-PROCESSOR_VERSION = "22-contained-scanner-seam-crop"
+PROCESSOR_VERSION = "23-nested-neutral-frame-crop"
 
 
 def select_pdfs_with_dialog() -> list[Path]:
@@ -123,6 +125,143 @@ def normalize_image(image: Image.Image) -> Image.Image:
     return rgb
 
 
+def detect_nested_neutral_frame_box(
+    rgb: np.ndarray,
+) -> tuple[int, int, int, int] | None:
+    """Detect a white/gray scanner frame around a full-bleed colorful page.
+
+    This handles nested borders where a narrow white outer rim hides a much
+    wider gray scanner-bed band.  It is deliberately limited to colorful,
+    textured pages with a strong, nearly full-length rectangular transition;
+    ordinary white document margins must not be cropped to their text block.
+    """
+    height, width = rgb.shape[:2]
+    if height < 200 or width < 200:
+        return None
+
+    hsv = np.asarray(Image.fromarray(rgb, "RGB").convert("HSV"))
+    central_sat = hsv[
+        height // 8 : 7 * height // 8,
+        width // 8 : 7 * width // 8,
+        1,
+    ]
+    if float(np.mean(central_sat >= 45)) < 0.22:
+        return None
+
+    gray = (
+        0.2126 * rgb[:, :, 0]
+        + 0.7152 * rgb[:, :, 1]
+        + 0.0722 * rgb[:, :, 2]
+    ).astype(np.float32)
+    y_trim = max(5, int(height * 0.03))
+    x_trim = max(5, int(width * 0.03))
+    column_texture = np.std(gray[y_trim : height - y_trim, :], axis=0)
+    row_texture = np.std(gray[:, x_trim : width - x_trim], axis=1)
+
+    def candidate(profile: np.ndarray, maximum: int) -> int:
+        smooth = ndimage.uniform_filter1d(
+            profile.astype(np.float32), size=5, mode="nearest"
+        )
+        textured = smooth >= 12.0
+        sustained = ndimage.uniform_filter1d(
+            textured.astype(np.float32), size=11, mode="constant"
+        ) >= 0.82
+        found = np.flatnonzero(sustained[5:maximum])
+        if not found.size:
+            return 0
+        depth = int(found[0] + 5)
+        # The region before the page must itself be a low-texture scanner
+        # frame, not ordinary page content followed by a photograph.
+        outer = smooth[max(0, int(depth * 0.08)) : max(1, depth - 5)]
+        if outer.size < 5 or float(np.median(outer)) > 7.0:
+            return 0
+        return depth
+
+    max_x = max(1, int(width * 0.28))
+    max_y = max(1, int(height * 0.18))
+    left = candidate(column_texture, max_x)
+    right_depth = candidate(column_texture[::-1], max_x)
+    top = candidate(row_texture, max_y)
+    bottom_depth = candidate(row_texture[::-1], max_y)
+
+    def strong_transition(position: int, axis: int, reversed_side: bool) -> bool:
+        if not position:
+            return False
+        coordinate = (width - position if axis == 1 else height - position) if reversed_side else position
+        limit = width if axis == 1 else height
+        if coordinate < 5 or coordinate > limit - 5:
+            return False
+        if axis == 1:
+            before = rgb[:, coordinate - 5 : coordinate].astype(np.float32).mean(axis=1)
+            after = rgb[:, coordinate : coordinate + 5].astype(np.float32).mean(axis=1)
+        else:
+            before = rgb[coordinate - 5 : coordinate].astype(np.float32).mean(axis=0)
+            after = rgb[coordinate : coordinate + 5].astype(np.float32).mean(axis=0)
+        difference = np.linalg.norm(after - before, axis=1)
+        return float(np.mean(difference >= 25.0)) >= 0.62
+
+    def nested_transition_depth(axis: int, reversed_side: bool, maximum: int) -> int:
+        """Find the inner edge of a neutral frame, even if the page starts flat."""
+        work = rgb[:, ::-1] if axis == 1 and reversed_side else rgb
+        if axis == 0:
+            work = work[::-1, :] if reversed_side else work
+        smooth = ndimage.uniform_filter1d(
+            work.astype(np.float32), size=5, axis=axis, mode="nearest"
+        )
+        if axis == 1:
+            delta = np.linalg.norm(smooth[:, 6:] - smooth[:, :-6], axis=2)
+            shares = np.mean(delta >= 25.0, axis=0)
+        else:
+            delta = np.linalg.norm(smooth[6:] - smooth[:-6], axis=2)
+            shares = np.mean(delta >= 25.0, axis=1)
+        possible = np.flatnonzero(shares[: max(0, maximum - 6)] >= 0.62) + 3
+        if not possible.size:
+            return 0
+        work_i16 = work.astype(np.int16)
+        chroma = np.max(work_i16, axis=2) - np.min(work_i16, axis=2)
+        # Work inward from the deepest transition.  Internal design rules are
+        # rejected because the entire region before them is no longer a
+        # low-chroma white/gray scanner frame.
+        for depth in possible[::-1]:
+            outer_start = max(0, int(depth * 0.05))
+            outer_stop = max(outer_start + 1, int(depth) - 4)
+            outer = (
+                chroma[:, outer_start:outer_stop]
+                if axis == 1
+                else chroma[outer_start:outer_stop, :]
+            )
+            if outer.size and float(np.mean(outer <= 15)) >= 0.90:
+                return int(depth)
+        return 0
+
+    if left and not strong_transition(left, 1, False):
+        left = 0
+    if right_depth and not strong_transition(right_depth, 1, True):
+        right_depth = 0
+    if top and not strong_transition(top, 0, False):
+        top = 0
+    if bottom_depth and not strong_transition(bottom_depth, 0, True):
+        bottom_depth = 0
+
+    if not left:
+        left = nested_transition_depth(1, False, max_x)
+    if not right_depth:
+        right_depth = nested_transition_depth(1, True, max_x)
+    if not top:
+        top = nested_transition_depth(0, False, max_y)
+    if not bottom_depth:
+        bottom_depth = nested_transition_depth(0, True, max_y)
+
+    detected_sides = sum(bool(value) for value in (left, right_depth, top, bottom_depth))
+    if detected_sides < 3:
+        return None
+    right = width - right_depth
+    bottom = height - bottom_depth
+    if right - left < width * 0.60 or bottom - top < height * 0.65:
+        return None
+    return left, top, right, bottom
+
+
 def detect_physical_crop_box(image: Image.Image) -> tuple[int, int, int, int]:
     """Return a conservative rectangular crop for scanner-bed borders.
 
@@ -140,6 +279,10 @@ def detect_physical_crop_box(image: Image.Image) -> tuple[int, int, int, int]:
     height, width = gray.shape
     if height < 200 or width < 200:
         return 0, 0, width, height
+
+    nested_frame = detect_nested_neutral_frame_box(rgb)
+    if nested_frame is not None:
+        return nested_frame
 
     center = gray[height // 5 : 4 * height // 5, width // 5 : 4 * width // 5]
     paper = float(np.percentile(center, 70))
@@ -910,6 +1053,89 @@ def save_png(
     image.save(path, "PNG", compress_level=6, dpi=(dpi, dpi), pnginfo=pnginfo)
 
 
+def set_jpeg_dpi_metadata(path: Path, dpi: int) -> None:
+    """Set JFIF density without decoding or recompressing JPEG pixels."""
+    data = bytearray(path.read_bytes())
+    if data[:2] != b"\xff\xd8":
+        raise RuntimeError(f"JPEG文件头无效：{path}")
+    density = struct.pack(">H", dpi)
+    offset = 2
+    while offset + 4 <= len(data) and data[offset] == 0xFF:
+        marker = data[offset + 1]
+        if marker == 0xDA:
+            break
+        if marker in {0x01, 0xD8, 0xD9} or 0xD0 <= marker <= 0xD7:
+            offset += 2
+            continue
+        length = int.from_bytes(data[offset + 2 : offset + 4], "big")
+        if length < 2 or offset + 2 + length > len(data):
+            raise RuntimeError(f"JPEG段结构无效：{path}")
+        if marker == 0xE0 and data[offset + 4 : offset + 9] == b"JFIF\x00":
+            if length < 16:
+                raise RuntimeError(f"JPEG JFIF段过短：{path}")
+            data[offset + 11] = 1
+            data[offset + 12 : offset + 14] = density
+            data[offset + 14 : offset + 16] = density
+            path.write_bytes(data)
+            return
+        offset += 2 + length
+
+    jfif_payload = b"JFIF\x00\x01\x01\x01" + density + density + b"\x00\x00"
+    jfif_segment = b"\xff\xe0" + struct.pack(">H", len(jfif_payload) + 2) + jfif_payload
+    path.write_bytes(data[:2] + jfif_segment + data[2:])
+
+
+def set_png_dpi_metadata(path: Path, dpi: int) -> None:
+    """Insert or replace PNG pHYs without decoding or recompressing pixels."""
+    data = path.read_bytes()
+    signature = b"\x89PNG\r\n\x1a\n"
+    if not data.startswith(signature):
+        raise RuntimeError(f"PNG文件头无效：{path}")
+    pixels_per_meter = round(dpi / 0.0254)
+    chunk_type = b"pHYs"
+    chunk_data = struct.pack(">IIB", pixels_per_meter, pixels_per_meter, 1)
+    replacement = (
+        struct.pack(">I", len(chunk_data))
+        + chunk_type
+        + chunk_data
+        + struct.pack(">I", zlib.crc32(chunk_type + chunk_data) & 0xFFFFFFFF)
+    )
+    output = bytearray(signature)
+    offset = len(signature)
+    inserted = False
+    while offset + 12 <= len(data):
+        length = int.from_bytes(data[offset : offset + 4], "big")
+        end = offset + 12 + length
+        if end > len(data):
+            raise RuntimeError(f"PNG块结构无效：{path}")
+        current_type = data[offset + 4 : offset + 8]
+        if current_type == b"pHYs":
+            if not inserted:
+                output.extend(replacement)
+                inserted = True
+        else:
+            output.extend(data[offset:end])
+            if current_type == b"IHDR" and not inserted:
+                output.extend(replacement)
+                inserted = True
+        offset = end
+    if offset != len(data):
+        raise RuntimeError(f"PNG尾部结构无效：{path}")
+    path.write_bytes(output)
+
+
+def set_image_dpi_metadata(path: Path, dpi: int) -> None:
+    suffix = path.suffix.lower()
+    if suffix in {".jpg", ".jpeg"}:
+        set_jpeg_dpi_metadata(path, dpi)
+    elif suffix == ".png":
+        set_png_dpi_metadata(path, dpi)
+    else:
+        raise RuntimeError(
+            f"无法在不重新编码像素的前提下为{suffix or '未知格式'}写入DPI：{path}"
+        )
+
+
 def valid_existing_png(
     path: Path,
     expected_version: str | None = None,
@@ -992,6 +1218,7 @@ def process_pdf(
     overwrite: bool,
     workers: int,
     extract_only: bool = False,
+    extract_dpi: int | None = None,
 ) -> None:
     pdf_path = pdf_path.expanduser().resolve()
     if not pdf_path.is_file() or pdf_path.suffix.lower() != ".pdf":
@@ -1015,7 +1242,10 @@ def process_pdf(
         print(f"原始图片：{original_dir}")
         print(f"处理图片：{processed_dir}")
         if extract_only:
-            print("模式：仅提取原图，不处理图片\n")
+            if extract_dpi is not None:
+                print(f"模式：仅提取原图，并写入{extract_dpi} DPI元数据；不处理图片\n")
+            else:
+                print("模式：仅提取原图，不处理图片\n")
             print("提取并保存原始页面", flush=True)
         else:
             print(f"模式：{mode}\n")
@@ -1041,6 +1271,10 @@ def process_pdf(
                     original_status = "渲染PNG"
                 else:
                     original_status = "沿用渲染PNG"
+
+            if extract_dpi is not None:
+                set_image_dpi_metadata(original_path, extract_dpi)
+                original_status += f"；DPI={extract_dpi}"
 
             remove_other_page_images(original_dir, stem, original_path)
             original_paths.append(original_path)
@@ -1118,6 +1352,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="只提取PDF逐页原图并创建-processed目录，不处理任何图片",
     )
+    parser.add_argument(
+        "--extract-dpi",
+        type=int,
+        default=None,
+        help="仅提取时写入指定DPI元数据；JPEG/PNG不重新编码像素",
+    )
     return parser
 
 
@@ -1129,6 +1369,11 @@ def main() -> int:
     if args.workers < 1 or args.workers > 32:
         print("工作线程数必须在1到32之间。", file=sys.stderr)
         return 2
+    if args.extract_dpi is not None:
+        if args.extract_dpi < 1 or args.extract_dpi > 65535:
+            print("提取图片DPI必须在1到65535之间。", file=sys.stderr)
+            return 2
+        args.extract_only = True
 
     pending = list(args.pdf)
     had_error = False
@@ -1156,6 +1401,7 @@ def main() -> int:
                     args.overwrite,
                     args.workers,
                     args.extract_only,
+                    args.extract_dpi,
                 )
             except Exception as exc:
                 had_error = True
