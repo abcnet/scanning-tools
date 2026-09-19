@@ -7,7 +7,7 @@ PDF 图片处理工具（合并版 V26）
 
 图片处理和图片提取共用这同一份程序、同一套PDF解析和原图提取代码，只是启动参数不同。
 
-四个入口
+五个入口
 --------
 1. 仅提取图片
    Windows：Windows-仅提取图片.bat
@@ -44,6 +44,14 @@ PDF 图片处理工具（合并版 V26）
    实际调用：pdf_image_processor.py --extract-only --extract-dpi 300
    像素尺寸不缩放，-processed目录保持为空。JPEG只修改或加入JFIF密度字段，
    PNG只修改或加入pHYs块；均不解码、不重新压缩图片像素。
+
+5. 提取图片并设为600 DPI
+   Windows：Windows-提取图片-600DPI.bat
+   macOS：macOS-提取图片-600DPI.command
+
+   实际调用：pdf_image_processor.py --extract-only --extract-dpi 600
+   与300 DPI入口相同，像素尺寸不缩放，-processed目录保持为空。
+   JPEG/PNG只修改DPI元数据，不解码、不重新压缩图片像素。
 
 共同操作方法
 ------------
