@@ -1,0 +1,51 @@
+PDF 图片处理工具（合并版）
+==========================
+
+本工具以原“PDF逐页图片保真处理工具”V22为基础。压缩包内只有一份主程序：
+
+    pdf_image_processor.py
+
+图片处理和图片提取共用这同一份程序、同一套PDF解析和原图提取代码，只是启动参数不同。
+
+三个入口
+--------
+1. 仅提取图片
+   Windows：Windows-仅提取图片.bat
+   macOS：macOS-仅提取图片.command
+
+   实际调用：pdf_image_processor.py --extract-only
+   创建“PDF同名目录”和“PDF原名-processed”目录；原图放入同名目录，
+   -processed目录保持为空，不运行图片清理代码。
+
+2. 保真处理图片
+   Windows：Windows-保真处理图片.bat
+   macOS：macOS-保真处理图片.command
+
+   实际调用：pdf_image_processor.py
+   完整执行原V22流程：先提取原图，再生成-processed目录中的保真处理图片。
+
+3. 仅裁边
+   Windows：Windows-仅裁边.bat
+   macOS：macOS-仅裁边.command
+
+   实际调用：pdf_image_processor.py --mode border-only
+   只运行原V22的物理边缘裁切检测。不会降噪、除黄、提亮背景、调整颜色、
+   对比度或锐度；裁切框以内的像素值保持不变。结果写入-processed目录。
+
+共同操作方法
+------------
+双击所需入口，把一个或多个PDF拖入窗口并按回车。直接按回车打开多选窗口；
+一批完成后可继续拖入下一批；输入Q退出。
+
+断点续跑
+--------
+两个入口沿用原工具逻辑：已有且内容相同的原图会沿用，缺失、无效或内容变化的页面
+会重新保存。仅提取模式不会读取、修改或删除-processed目录里的任何已有图片。
+
+如果仅在PDF末尾增加页面，可直接再次运行。如果在中间插入、删除或重排页面，
+建议先移走原图和-processed目录，避免旧页码与新PDF页码错位。
+
+依赖
+----
+Python 3、PyMuPDF、Pillow、NumPy、SciPy。Windows入口会检查依赖，并在缺少时
+按requirements.txt尝试安装。

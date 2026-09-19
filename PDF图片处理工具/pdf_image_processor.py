@@ -736,6 +736,8 @@ def detect_aged_paper_stains(
 
 def process_image(image: Image.Image, mode: str) -> Image.Image:
     """Whiten high-confidence paper background without generating details."""
+    if mode == "border-only":
+        return crop_physical_scanner_borders(image)
     image = normalize_image(image)
     image = crop_physical_scanner_borders(image)
     if image.mode == "L":
@@ -956,27 +958,40 @@ def process_saved_page(
         raise RuntimeError(f"原始页面图片无效或缺失：{original_path}")
 
     source_sha256 = hashlib.sha256(original_path.read_bytes()).hexdigest()
+    output_version = (
+        f"{PROCESSOR_VERSION}-border-only"
+        if mode == "border-only"
+        else PROCESSOR_VERSION
+    )
     if not overwrite and valid_existing_png(
-        processed_path, PROCESSOR_VERSION, source_sha256
+        processed_path, output_version, source_sha256
     ):
         return index, "跳过"
 
     with Image.open(original_path) as opened:
-        original = normalize_image(opened)
+        if mode == "border-only":
+            original = ImageOps.exif_transpose(opened)
+        else:
+            original = normalize_image(opened)
         original.load()
     processed = process_image(original, mode)
     save_png(
         processed,
         processed_path,
         dpi,
-        PROCESSOR_VERSION,
+        output_version,
         source_sha256,
     )
     return index, "处理"
 
 
 def process_pdf(
-    pdf_path: Path, dpi: int, mode: str, overwrite: bool, workers: int
+    pdf_path: Path,
+    dpi: int,
+    mode: str,
+    overwrite: bool,
+    workers: int,
+    extract_only: bool = False,
 ) -> None:
     pdf_path = pdf_path.expanduser().resolve()
     if not pdf_path.is_file() or pdf_path.suffix.lower() != ".pdf":
@@ -999,8 +1014,12 @@ def process_pdf(
         print(f"页数：{total}")
         print(f"原始图片：{original_dir}")
         print(f"处理图片：{processed_dir}")
-        print(f"模式：{mode}\n")
-        print("阶段 1/2：提取并保存全部原始页面", flush=True)
+        if extract_only:
+            print("模式：仅提取原图，不处理图片\n")
+            print("提取并保存原始页面", flush=True)
+        else:
+            print(f"模式：{mode}\n")
+            print("阶段 1/2：提取并保存全部原始页面", flush=True)
 
         for index, page in enumerate(document):
             stem = f"{index + 1:0{digits}d}"
@@ -1030,6 +1049,10 @@ def process_pdf(
                 f"[提取 {index + 1:0{digits}d}/{total}] 原图:{original_status}",
                 flush=True,
             )
+
+    if extract_only:
+        print("\n完成：只提取原图；-processed 目录保持不处理。", flush=True)
+        return
 
     # Do not begin cleanup until every source page has been saved.  Processing
     # from the saved images also makes the two stages independently resumable.
@@ -1070,9 +1093,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dpi", type=int, default=300, help="复杂页面回退渲染 DPI，默认300")
     parser.add_argument(
         "--mode",
-        choices=("safe", "strong"),
+        choices=("safe", "strong", "border-only"),
         default="strong",
-        help="strong清理灰斑更彻底；safe更保守，默认strong",
+        help="strong清理灰斑更彻底；safe更保守；border-only只裁边，默认strong",
     )
     parser.add_argument(
         "--overwrite",
@@ -1089,6 +1112,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--once",
         action="store_true",
         help="处理命令行中的文件后立即退出，不继续弹出选择窗口",
+    )
+    parser.add_argument(
+        "--extract-only",
+        action="store_true",
+        help="只提取PDF逐页原图并创建-processed目录，不处理任何图片",
     )
     return parser
 
@@ -1127,6 +1155,7 @@ def main() -> int:
                     args.mode,
                     args.overwrite,
                     args.workers,
+                    args.extract_only,
                 )
             except Exception as exc:
                 had_error = True

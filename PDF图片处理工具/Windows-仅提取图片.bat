@@ -1,10 +1,10 @@
 @echo off
 setlocal EnableExtensions
-title PDF Page Image Processor
+title PDF Image Tool - Extract Only
 cd /d "%~dp0"
 
 echo ========================================
-echo PDF Page Image Processor - Windows
+echo PDF Image Tool - Extract Only
 echo ========================================
 echo.
 
@@ -43,32 +43,23 @@ echo Drag one or more PDF files into this window, then press Enter.
 echo Press Enter on an empty line to open the file picker.
 echo After each batch, the program keeps waiting. Type Q to exit.
 echo.
-call %PYTHON_CMD% "%~dp0pdf_image_processor.py" %*
+call %PYTHON_CMD% "%~dp0pdf_image_processor.py" --extract-only %*
 if errorlevel 1 goto PROCESS_FAILED
-
-echo.
-echo Completed. Output folders are beside the source PDF.
 goto END
 
 :NO_PYTHON
 echo.
 echo ERROR: Python 3 was not found.
-echo Download Python from:
-echo https://www.python.org/downloads/windows/
-echo Select "Add python.exe to PATH" during installation.
 goto END
 
 :INSTALL_FAILED
 echo.
 echo ERROR: Package installation failed.
-echo Check the messages above and your network connection.
 goto END
 
 :PROCESS_FAILED
 echo.
-echo ERROR: PDF processing failed.
-echo Copy all messages shown above when requesting help.
-goto END
+echo ERROR: PDF extraction failed. Check the messages above.
 
 :END
 echo.
