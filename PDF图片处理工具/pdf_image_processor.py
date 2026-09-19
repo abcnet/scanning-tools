@@ -19,6 +19,7 @@ import shlex
 import struct
 import subprocess
 import sys
+import tempfile
 import zlib
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -29,7 +30,7 @@ from PIL import Image, ImageOps, PngImagePlugin
 from scipy import ndimage
 
 
-PROCESSOR_VERSION = "23-nested-neutral-frame-crop"
+PROCESSOR_VERSION = "26-independent-page-crop"
 
 
 def select_pdfs_with_dialog() -> list[Path]:
@@ -139,15 +140,6 @@ def detect_nested_neutral_frame_box(
     if height < 200 or width < 200:
         return None
 
-    hsv = np.asarray(Image.fromarray(rgb, "RGB").convert("HSV"))
-    central_sat = hsv[
-        height // 8 : 7 * height // 8,
-        width // 8 : 7 * width // 8,
-        1,
-    ]
-    if float(np.mean(central_sat >= 45)) < 0.22:
-        return None
-
     gray = (
         0.2126 * rgb[:, :, 0]
         + 0.7152 * rgb[:, :, 1]
@@ -252,6 +244,31 @@ def detect_nested_neutral_frame_box(
     if not bottom_depth:
         bottom_depth = nested_transition_depth(0, True, max_y)
 
+    hsv = np.asarray(Image.fromarray(rgb, "RGB").convert("HSV"))
+    central_sat = hsv[
+        height // 8 : 7 * height // 8,
+        width // 8 : 7 * width // 8,
+        1,
+    ]
+    colorful_page = float(np.mean(central_sat >= 45)) >= 0.22
+    if not colorful_page:
+        outside_regions = []
+        if left:
+            outside_regions.append(gray[:, :left])
+        if right_depth:
+            outside_regions.append(gray[:, width - right_depth :])
+        if top:
+            outside_regions.append(gray[:top, :])
+        if bottom_depth:
+            outside_regions.append(gray[height - bottom_depth :, :])
+        dark_frame_sides = sum(
+            float(np.mean(region < 200.0)) >= 0.25
+            for region in outside_regions
+            if region.size
+        )
+        if dark_frame_sides < 2:
+            return None
+
     detected_sides = sum(bool(value) for value in (left, right_depth, top, bottom_depth))
     if detected_sides < 3:
         return None
@@ -260,6 +277,238 @@ def detect_nested_neutral_frame_box(
     if right - left < width * 0.60 or bottom - top < height * 0.65:
         return None
     return left, top, right, bottom
+
+
+def detect_single_sided_neutral_strip_box(
+    rgb: np.ndarray,
+) -> tuple[int, int, int, int]:
+    """Detect an isolated gray/black scanner-bed strip on any one side.
+
+    Some Epson pages have a scanner-bed band on only one physical edge.  The
+    older rectangular-frame detector deliberately required three sides and
+    therefore rejected these obvious one-sided cases.  A single side is safe
+    to remove only when its whole outer region is neutral and low-texture and
+    its inner edge is a strong transition along most of the page.
+    """
+    height, width = rgb.shape[:2]
+    if height < 200 or width < 200:
+        return 0, 0, width, height
+
+    work = rgb.astype(np.float32)
+    work_i16 = rgb.astype(np.int16)
+    base_chroma = np.max(work_i16, axis=2) - np.min(work_i16, axis=2)
+    base_gray = (
+        0.2126 * work[:, :, 0]
+        + 0.7152 * work[:, :, 1]
+        + 0.0722 * work[:, :, 2]
+    )
+
+    def transition_profile(axis: int) -> np.ndarray:
+        smooth = ndimage.uniform_filter1d(work, size=5, axis=axis, mode="nearest")
+        if axis == 1:
+            delta = np.linalg.norm(smooth[:, 6:] - smooth[:, :-6], axis=2)
+            return np.mean(delta >= 20.0, axis=0)
+        delta = np.linalg.norm(smooth[6:] - smooth[:-6], axis=2)
+        return np.mean(delta >= 20.0, axis=1)
+
+    def depth_for_side(
+        axis: int,
+        reverse: bool,
+        maximum: int,
+        transition_share: np.ndarray,
+    ) -> int:
+        candidates = np.flatnonzero(
+            transition_share[: max(0, maximum - 6)] >= 0.50
+        ) + 3
+        if not candidates.size:
+            return 0
+
+        chroma = np.flip(base_chroma, axis=axis) if reverse else base_chroma
+        gray = np.flip(base_gray, axis=axis) if reverse else base_gray
+
+        # Prefer the deepest valid transition.  This removes a white outer
+        # hairline together with the gray bed rather than stopping between
+        # those two scanner artifacts.
+        for depth in candidates[::-1]:
+            depth = int(depth)
+            if depth < 6:
+                continue
+            outer_stop = max(2, depth - 5)
+            outer_chroma = (
+                chroma[:, :outer_stop] if axis == 1 else chroma[:outer_stop, :]
+            )
+            outer_gray = gray[:, :outer_stop] if axis == 1 else gray[:outer_stop, :]
+            if not outer_gray.size:
+                continue
+
+            neutral_share = float(np.mean(outer_chroma <= 15))
+            line_texture = (
+                np.std(outer_gray, axis=0)
+                if axis == 1
+                else np.std(outer_gray, axis=1)
+            )
+            low_texture_share = float(np.mean(line_texture <= 10.0))
+            # Scanner-bed illumination may change gradually along a long gray
+            # strip, making its full-column standard deviation look large.
+            # Local gradients still remain almost entirely flat, unlike text,
+            # photographs, or a designed sidebar.
+            gradient_inward = np.abs(np.diff(outer_gray, axis=axis))
+            gradient_cross = np.abs(np.diff(outer_gray, axis=1 - axis))
+            smooth_gradient_share = min(
+                float(np.mean(gradient_inward < 12.0))
+                if gradient_inward.size else 1.0,
+                float(np.mean(gradient_cross < 12.0))
+                if gradient_cross.size else 1.0,
+            )
+            outer_level = float(np.median(outer_gray))
+
+            inner_start = min(
+                (width if axis == 1 else height) - 1,
+                depth + 8,
+            )
+            inner_stop = min(
+                width if axis == 1 else height,
+                inner_start + max(12, depth // 3),
+            )
+            inner_gray = (
+                gray[:, inner_start:inner_stop]
+                if axis == 1
+                else gray[inner_start:inner_stop, :]
+            )
+            if not inner_gray.size:
+                continue
+            inner_level = float(np.median(inner_gray))
+            edge_share = float(transition_share[depth - 3])
+            axis_size = width if axis == 1 else height
+            deep_relaxed_band = depth >= max(80, int(axis_size * 0.05))
+            dark_shallow_band = (
+                outer_level <= 190.0
+                and edge_share >= 0.60
+                and smooth_gradient_share >= 0.96
+            )
+            texture_evidence = (
+                (edge_share >= 0.72 and low_texture_share >= 0.82)
+                or (
+                    deep_relaxed_band
+                    and edge_share >= 0.50
+                    and smooth_gradient_share >= 0.96
+                )
+                or dark_shallow_band
+            )
+
+            # A gray/black scanner band is materially darker than the page
+            # just inside it.  The absolute ceiling prevents an ordinary
+            # white document margin and text-column boundary from qualifying.
+            if (
+                neutral_share >= 0.90
+                and texture_evidence
+                and outer_level <= 238.0
+                and inner_level - outer_level >= 12.0
+            ):
+                return depth
+        return 0
+
+    max_x = max(1, int(width * 0.28))
+    max_y = max(1, int(height * 0.18))
+    x_transitions = transition_profile(1)
+    left = depth_for_side(1, False, max_x, x_transitions)
+    right_depth = depth_for_side(1, True, max_x, x_transitions[::-1])
+    del x_transitions
+    y_transitions = transition_profile(0)
+    top = depth_for_side(0, False, max_y, y_transitions)
+    bottom_depth = depth_for_side(0, True, max_y, y_transitions[::-1])
+    return left, top, width - right_depth, height - bottom_depth
+
+
+def refine_corner_residuals(
+    rgb: np.ndarray,
+    box: tuple[int, int, int, int],
+) -> tuple[int, int, int, int]:
+    """Remove a short gray corner sliver left after a main edge crop.
+
+    A skewed or curled sheet can expose the scanner bed only near one corner.
+    Such a run is too short for a safe stand-alone side detection.  Once the
+    adjoining top/bottom scanner band is independently confirmed, however, a
+    narrow neutral sliver at that same corner can safely refine the rectangle.
+    """
+    height, width = rgb.shape[:2]
+    left, top, right, bottom = box
+    if top == 0 and bottom == height:
+        return box
+
+    work = rgb.astype(np.float32)
+    gray = 0.2126 * work[:, :, 0] + 0.7152 * work[:, :, 1] + 0.0722 * work[:, :, 2]
+    rgb_i16 = rgb.astype(np.int16)
+    chroma = np.max(rgb_i16, axis=2) - np.min(rgb_i16, axis=2)
+    retained_height = bottom - top
+    retained_width = right - left
+    span_y = max(40, int(retained_height * 0.10))
+    max_x = max(8, int(retained_width * 0.05))
+
+    def corner_depth(region_gray: np.ndarray, region_chroma: np.ndarray) -> int:
+        profile = np.median(region_gray, axis=0)
+        paper = float(np.percentile(profile, 80))
+        cutoff = max(225.0, paper - 15.0)
+        bright = profile >= cutoff
+        sustained = ndimage.uniform_filter1d(
+            bright.astype(np.float32), size=5, mode="constant"
+        ) >= 0.80
+        found = np.flatnonzero(sustained[3:max_x])
+        if not found.size:
+            return 0
+        depth = int(found[0] + 3)
+        if depth < 3:
+            return 0
+        outer_gray = region_gray[:, :depth]
+        outer_chroma = region_chroma[:, :depth]
+        inner_gray = region_gray[:, depth + 3 : min(max_x, depth + 12)]
+        if not inner_gray.size:
+            return 0
+        if (
+            float(np.mean(outer_chroma <= 15)) >= 0.92
+            and float(np.mean(outer_gray < cutoff)) >= 0.60
+            and float(np.median(inner_gray) - np.median(outer_gray)) >= 18.0
+        ):
+            return depth
+        return 0
+
+    left_extra = 0
+    right_extra = 0
+    if bottom < height:
+        y0 = max(top, bottom - span_y)
+        left_extra = max(
+            left_extra,
+            corner_depth(
+                gray[y0:bottom, left : min(right, left + max_x)],
+                chroma[y0:bottom, left : min(right, left + max_x)],
+            ),
+        )
+        right_extra = max(
+            right_extra,
+            corner_depth(
+                gray[y0:bottom, max(left, right - max_x) : right][:, ::-1],
+                chroma[y0:bottom, max(left, right - max_x) : right][:, ::-1],
+            ),
+        )
+    if top > 0:
+        y1 = min(bottom, top + span_y)
+        left_extra = max(
+            left_extra,
+            corner_depth(
+                gray[top:y1, left : min(right, left + max_x)],
+                chroma[top:y1, left : min(right, left + max_x)],
+            ),
+        )
+        right_extra = max(
+            right_extra,
+            corner_depth(
+                gray[top:y1, max(left, right - max_x) : right][:, ::-1],
+                chroma[top:y1, max(left, right - max_x) : right][:, ::-1],
+            ),
+        )
+    if right - right_extra - (left + left_extra) < retained_width * 0.90:
+        return box
+    return left + left_extra, top, right - right_extra, bottom
 
 
 def detect_physical_crop_box(image: Image.Image) -> tuple[int, int, int, int]:
@@ -280,9 +529,24 @@ def detect_physical_crop_box(image: Image.Image) -> tuple[int, int, int, int]:
     if height < 200 or width < 200:
         return 0, 0, width, height
 
+    single_sided = detect_single_sided_neutral_strip_box(rgb)
+
     nested_frame = detect_nested_neutral_frame_box(rgb)
     if nested_frame is not None:
-        return nested_frame
+        # A rectangular frame and a much deeper isolated scanner strip may
+        # coexist on the same page.  Keep the stable frame result for tiny
+        # disagreements, but accept a single-side result when it identifies a
+        # materially wider outer band from this page's own pixels.
+        left, top, right, bottom = nested_frame
+        if single_sided[0] >= left + 20:
+            left = single_sided[0]
+        if single_sided[1] >= top + 20:
+            top = single_sided[1]
+        if single_sided[2] <= right - 20:
+            right = single_sided[2]
+        if single_sided[3] <= bottom - 20:
+            bottom = single_sided[3]
+        return refine_corner_residuals(rgb, (left, top, right, bottom))
 
     center = gray[height // 5 : 4 * height // 5, width // 5 : 4 * width // 5]
     paper = float(np.percentile(center, 70))
@@ -472,8 +736,14 @@ def detect_physical_crop_box(image: Image.Image) -> tuple[int, int, int, int]:
     bottom = height - bottom_depth
 
     if right - left < width * 0.70 or bottom - top < height * 0.75:
-        return 0, 0, width, height
-    return left, top, right, bottom
+        left, top, right, bottom = 0, 0, width, height
+    combined = (
+        max(left, single_sided[0]),
+        max(top, single_sided[1]),
+        min(right, single_sided[2]),
+        min(bottom, single_sided[3]),
+    )
+    return refine_corner_residuals(rgb, combined)
 
 
 def crop_physical_scanner_borders(image: Image.Image) -> Image.Image:
@@ -877,12 +1147,21 @@ def detect_aged_paper_stains(
     return stain, True
 
 
-def process_image(image: Image.Image, mode: str) -> Image.Image:
+def process_image(
+    image: Image.Image,
+    mode: str,
+    crop_box: tuple[int, int, int, int] | None = None,
+) -> Image.Image:
     """Whiten high-confidence paper background without generating details."""
     if mode == "border-only":
-        return crop_physical_scanner_borders(image)
+        if crop_box is None:
+            return crop_physical_scanner_borders(image)
+        return image.crop(crop_box)
     image = normalize_image(image)
-    image = crop_physical_scanner_borders(image)
+    if crop_box is None:
+        image = crop_physical_scanner_borders(image)
+    else:
+        image = image.crop(crop_box)
     if image.mode == "L":
         return process_grayscale(image, mode)
 
@@ -1050,7 +1329,27 @@ def save_png(
         pnginfo.add_text("pdf_image_processor_version", processor_version)
         if source_sha256 is not None:
             pnginfo.add_text("source_sha256", source_sha256)
-    image.save(path, "PNG", compress_level=6, dpi=(dpi, dpi), pnginfo=pnginfo)
+    # Encode to a unique file beside the destination, validate it, and only
+    # then replace the destination.  An interruption or filesystem hiccup can
+    # therefore never turn a previously complete page into a half-written PNG.
+    handle = tempfile.NamedTemporaryFile(
+        prefix=f".{path.stem}-", suffix=".png", dir=path.parent, delete=False
+    )
+    temporary = Path(handle.name)
+    handle.close()
+    try:
+        image.save(
+            temporary,
+            "PNG",
+            compress_level=6,
+            dpi=(dpi, dpi),
+            pnginfo=pnginfo,
+        )
+        with Image.open(temporary) as check:
+            check.verify()
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def set_jpeg_dpi_metadata(path: Path, dpi: int) -> None:
@@ -1175,9 +1474,202 @@ def remove_other_page_images(directory: Path, stem: str, keep: Path) -> None:
             candidate.unlink()
 
 
+def analyze_document_crop_boxes(
+    original_paths: list[Path],
+) -> tuple[list[tuple[int, int, int, int]], list[str]]:
+    """Analyze the whole document and infer weak edges from peer pages.
+
+    Pages are grouped by orientation and portrait canvas width.  Only groups
+    with at least four four-sided direct detections establish a consensus.
+    Directly detected sides always win; consensus fills missing sides only.
+    """
+    sizes: list[tuple[int, int]] = []
+    direct: list[tuple[int, int, int, int]] = []
+    keys: list[str] = []
+    for path in original_paths:
+        with Image.open(path) as opened:
+            image = ImageOps.exif_transpose(opened)
+            image.load()
+        width, height = image.size
+        sizes.append((width, height))
+        direct.append(detect_physical_crop_box(image))
+        if width > height:
+            keys.append("landscape")
+        elif width / max(height, 1) < 0.70:
+            keys.append("portrait-narrow")
+        else:
+            keys.append("portrait-wide")
+
+    boxes = list(direct)
+    sources = ["直接检测" for _ in boxes]
+    for key in sorted(set(keys)):
+        members = [i for i, item in enumerate(keys) if item == key]
+        references = []
+        for i in members:
+            width, height = sizes[i]
+            left, top, right, bottom = direct[i]
+            margins = (left, top, width - right, height - bottom)
+            if all(value > 0 for value in margins):
+                references.append(i)
+        if len(references) < 4:
+            continue
+
+        target_width = int(round(float(np.median([
+            direct[i][2] - direct[i][0] for i in references
+        ]))))
+        target_height = int(round(float(np.median([
+            direct[i][3] - direct[i][1] for i in references
+        ]))))
+        typical_left = int(round(float(np.median([direct[i][0] for i in references]))))
+        typical_top = int(round(float(np.median([direct[i][1] for i in references]))))
+        typical_right_margin = int(round(float(np.median([
+            sizes[i][0] - direct[i][2] for i in references
+        ]))))
+        typical_bottom_margin = int(round(float(np.median([
+            sizes[i][1] - direct[i][3] for i in references
+        ]))))
+
+        def nearby_long_edge(
+            path: Path,
+            axis: int,
+            expected: int,
+            span: int,
+        ) -> int | None:
+            with Image.open(path) as opened:
+                image = ImageOps.exif_transpose(opened).convert("RGB")
+                rgb = np.asarray(image, dtype=np.float32)
+            smooth = ndimage.uniform_filter1d(rgb, size=5, axis=axis, mode="nearest")
+            if axis == 1:
+                delta = np.linalg.norm(smooth[:, 6:] - smooth[:, :-6], axis=2)
+                shares = np.mean(delta >= 25.0, axis=0)
+                limit = rgb.shape[1]
+            else:
+                delta = np.linalg.norm(smooth[6:] - smooth[:-6], axis=2)
+                shares = np.mean(delta >= 25.0, axis=1)
+                limit = rgb.shape[0]
+            lo = max(3, expected - span)
+            hi = min(limit - 4, expected + span)
+            if hi <= lo:
+                return None
+            window = shares[lo - 3 : hi - 3]
+            if not window.size:
+                return None
+            relative = int(np.argmax(window))
+            if float(window[relative]) < 0.35:
+                return None
+            return lo + relative
+
+        def infer_axis(
+            size: int,
+            start: int,
+            end: int,
+            target: int,
+            typical_start: int,
+            typical_end_margin: int,
+        ) -> tuple[int, int, bool]:
+            start_known = start > 0
+            end_known = end < size
+            if start_known and end_known:
+                return start, end, False
+            if target <= 0 or target > size:
+                return start, end, False
+            if start_known:
+                tolerance = max(80, int(size * 0.06))
+                if abs(start - typical_start) > tolerance:
+                    return start, end, False
+                inferred_end = start + target
+                if inferred_end <= size:
+                    return start, inferred_end, True
+            elif end_known:
+                tolerance = max(80, int(size * 0.06))
+                if abs((size - end) - typical_end_margin) > tolerance:
+                    return start, end, False
+                inferred_start = end - target
+                if inferred_start >= 0:
+                    return inferred_start, end, True
+            else:
+                inferred_start = min(max(0, typical_start), size - target)
+                return inferred_start, inferred_start + target, True
+            return start, end, False
+
+        for i in members:
+            width, height = sizes[i]
+            left, top, right, bottom = direct[i]
+            refined_any = False
+            x_tolerance = max(80, int(width * 0.06))
+            y_tolerance = max(80, int(height * 0.06))
+            if not left or abs(left - typical_left) > x_tolerance:
+                refined = nearby_long_edge(
+                    original_paths[i], 1, typical_left, x_tolerance
+                )
+                if refined is not None:
+                    left = refined
+                    refined_any = True
+            expected_right = width - typical_right_margin
+            if right == width or abs(right - expected_right) > x_tolerance:
+                refined = nearby_long_edge(
+                    original_paths[i], 1, expected_right, x_tolerance
+                )
+                if refined is not None:
+                    right = refined
+                    refined_any = True
+            if not top or abs(top - typical_top) > y_tolerance:
+                refined = nearby_long_edge(
+                    original_paths[i], 0, typical_top, y_tolerance
+                )
+                if refined is not None:
+                    top = refined
+                    refined_any = True
+            expected_bottom = height - typical_bottom_margin
+            if bottom == height or abs(bottom - expected_bottom) > y_tolerance:
+                refined = nearby_long_edge(
+                    original_paths[i], 0, expected_bottom, y_tolerance
+                )
+                if refined is not None:
+                    bottom = refined
+                    refined_any = True
+            new_left, new_right, inferred_x = infer_axis(
+                width,
+                left,
+                right,
+                target_width,
+                typical_left,
+                typical_right_margin,
+            )
+            new_top, new_bottom, inferred_y = infer_axis(
+                height,
+                top,
+                bottom,
+                target_height,
+                typical_top,
+                typical_bottom_margin,
+            )
+            if inferred_x or inferred_y or refined_any:
+                # Reject implausibly aggressive inference.  The page rectangle
+                # must retain most of each canvas dimension and a normal area.
+                retained_width = new_right - new_left
+                retained_height = new_bottom - new_top
+                if (
+                    retained_width >= width * 0.60
+                    and retained_height >= height * 0.75
+                    and retained_width > 0
+                    and retained_height > 0
+                ):
+                    boxes[i] = (new_left, new_top, new_right, new_bottom)
+                    sources[i] = "整本PDF尺寸共识修正"
+    return boxes, sources
+
+
 def process_saved_page(
-    task: tuple[int, Path, Path, int, str, bool]
-) -> tuple[int, str]:
+    task: tuple[
+        int,
+        Path,
+        Path,
+        int,
+        str,
+        bool,
+    ]
+) -> tuple[int, str, tuple[int, int, int, int] | None]:
     index, original_path, processed_path, dpi, mode, overwrite = task
 
     if not valid_existing_png(original_path):
@@ -1192,7 +1684,7 @@ def process_saved_page(
     if not overwrite and valid_existing_png(
         processed_path, output_version, source_sha256
     ):
-        return index, "跳过"
+        return index, "跳过", None
 
     with Image.open(original_path) as opened:
         if mode == "border-only":
@@ -1200,7 +1692,8 @@ def process_saved_page(
         else:
             original = normalize_image(opened)
         original.load()
-    processed = process_image(original, mode)
+    crop_box = detect_physical_crop_box(original)
+    processed = process_image(original, mode, crop_box)
     save_png(
         processed,
         processed_path,
@@ -1208,7 +1701,7 @@ def process_saved_page(
         output_version,
         source_sha256,
     )
-    return index, "处理"
+    return index, "处理", crop_box
 
 
 def process_pdf(
@@ -1228,6 +1721,10 @@ def process_pdf(
     processed_dir = pdf_path.parent / f"{pdf_path.stem}-processed"
     original_dir.mkdir(exist_ok=True)
     processed_dir.mkdir(exist_ok=True)
+    # Remove only our own abandoned atomic-write files from an earlier
+    # interruption. Numbered page outputs and every other user file remain.
+    for temporary in processed_dir.glob(".[0-9]*-*.png"):
+        temporary.unlink(missing_ok=True)
 
     original_paths: list[Path] = []
 
@@ -1293,7 +1790,7 @@ def process_pdf(
     print("\n全部原始页面已经保存。", flush=True)
     active_workers = min(workers, total)
     print(
-        f"阶段 2/2：并行处理已保存的页面（{active_workers}个工作线程）",
+        f"阶段 2/2：每页独立并行检测并处理（{active_workers}个工作线程）",
         flush=True,
     )
 
@@ -1310,11 +1807,15 @@ def process_pdf(
     ]
     with ThreadPoolExecutor(max_workers=active_workers) as executor:
         results = executor.map(process_saved_page, tasks)
-        for index, processed_status in results:
+        for index, processed_status, crop_box in results:
+            crop_text = f"；裁切框:{crop_box}" if crop_box is not None else ""
             print(
-                f"[处理 {index + 1:0{digits}d}/{total}] 处理图:{processed_status}",
+                f"[处理 {index + 1:0{digits}d}/{total}] "
+                f"处理图:{processed_status}{crop_text}",
                 flush=True,
             )
+    for temporary in processed_dir.glob(".[0-9]*-*.png"):
+        temporary.unlink(missing_ok=True)
 
     print("\n完成。请先抽查文字、手写内容、灰色图形和黄色插图，再导入 Epson DCP。")
 
