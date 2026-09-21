@@ -75,6 +75,51 @@ return outputText
     return []
 
 
+def select_images_with_dialog() -> list[Path]:
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+
+        root = tk.Tk()
+        root.withdraw()
+        root.update()
+        selected = filedialog.askopenfilenames(
+            title="选择一个或多个需要设置 DPI 的图片",
+            filetypes=[
+                ("Supported images", "*.jpg *.jpeg *.png *.bmp *.tif *.tiff"),
+                ("All files", "*.*"),
+            ],
+        )
+        root.destroy()
+        return [Path(item) for item in selected]
+    except Exception:
+        pass
+
+    if sys.platform == "darwin":
+        script = '''
+set chosenFiles to choose file with prompt "选择一个或多个需要设置 DPI 的图片" of type {"public.image"} with multiple selections allowed
+set outputText to ""
+repeat with chosenFile in chosenFiles
+    set outputText to outputText & POSIX path of chosenFile & linefeed
+end repeat
+return outputText
+'''
+        try:
+            result = subprocess.run(
+                ["osascript", "-e", script],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode == 0:
+                return [Path(line) for line in result.stdout.splitlines() if line]
+            return []
+        except Exception:
+            pass
+
+    return []
+
+
 def parse_dragged_paths(raw: str) -> list[Path]:
     try:
         return [Path(item.strip('"')) for item in shlex.split(raw, posix=os.name != "nt")]
@@ -106,6 +151,27 @@ def request_pdf_batch() -> list[Path] | None:
         if selected:
             return selected
         print("已取消文件选择。程序仍在运行，可继续拖入 PDF；输入 Q 才会退出。")
+
+
+def request_image_batch() -> list[Path] | None:
+    while True:
+        print("\n请把一个或多个图片拖入此窗口，然后按回车。")
+        print("直接按回车：打开多选窗口    Q：退出程序")
+        try:
+            raw = input("> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return None
+
+        if raw.lower() in {"q", "quit", "exit"}:
+            return None
+        if raw:
+            return parse_dragged_paths(raw)
+
+        selected = select_images_with_dialog()
+        if selected:
+            return selected
+        print("已取消文件选择。程序仍在运行，可继续拖入图片；输入 Q 才会退出。")
 
 
 def normalize_image(image: Image.Image) -> Image.Image:
@@ -1449,6 +1515,86 @@ def set_image_dpi_metadata(path: Path, dpi: int) -> None:
         )
 
 
+IMAGE_DPI_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
+
+
+def set_bmp_dpi_metadata(path: Path, dpi: int) -> None:
+    data = bytearray(path.read_bytes())
+    if len(data) < 46 or data[:2] != b"BM":
+        raise RuntimeError(f"BMP文件结构无效：{path}")
+    dib_size = int.from_bytes(data[14:18], "little")
+    if dib_size < 40:
+        raise RuntimeError(f"BMP头不支持DPI字段：{path}")
+    pixels_per_meter = int(round(dpi / 0.0254))
+    data[38:42] = pixels_per_meter.to_bytes(4, "little", signed=True)
+    data[42:46] = pixels_per_meter.to_bytes(4, "little", signed=True)
+    path.write_bytes(data)
+
+
+def convert_image_dpi(source: Path, dpi: int) -> Path:
+    """Create a same-format copy with new DPI metadata and unchanged dimensions."""
+    source = source.expanduser().resolve()
+    suffix = source.suffix.lower()
+    if not source.is_file():
+        raise FileNotFoundError(f"找不到图片：{source}")
+    if suffix not in IMAGE_DPI_SUFFIXES:
+        supported = ", ".join(sorted(IMAGE_DPI_SUFFIXES))
+        raise RuntimeError(f"不支持的图片格式：{suffix or '无扩展名'}；支持：{supported}")
+
+    output = source.with_name(f"{source.stem}-{dpi}dpi{source.suffix}")
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{output.stem}-", suffix=output.suffix, dir=output.parent
+    )
+    os.close(descriptor)
+    temporary = Path(temporary_name)
+    try:
+        if suffix in {".jpg", ".jpeg", ".png", ".bmp"}:
+            temporary.write_bytes(source.read_bytes())
+            if suffix in {".jpg", ".jpeg", ".png"}:
+                set_image_dpi_metadata(temporary, dpi)
+            else:
+                set_bmp_dpi_metadata(temporary, dpi)
+        else:
+            # TIFF resolution tags live in its image directory. Pillow writes
+            # a lossless same-format copy while preserving every frame's
+            # decoded pixels and dimensions.
+            with Image.open(source) as opened:
+                source_format = opened.format or "TIFF"
+                frames: list[Image.Image] = []
+                frame_index = 0
+                while True:
+                    try:
+                        opened.seek(frame_index)
+                    except EOFError:
+                        break
+                    frames.append(opened.copy())
+                    frame_index += 1
+                if not frames:
+                    raise RuntimeError(f"图片没有可读取的帧：{source}")
+                save_options: dict[str, object] = {"dpi": (dpi, dpi)}
+                compression = opened.info.get("compression")
+                if compression:
+                    save_options["compression"] = compression
+                icc_profile = opened.info.get("icc_profile")
+                if icc_profile:
+                    save_options["icc_profile"] = icc_profile
+                if len(frames) > 1:
+                    save_options["save_all"] = True
+                    save_options["append_images"] = frames[1:]
+                frames[0].save(temporary, format=source_format, **save_options)
+
+        with Image.open(source) as before, Image.open(temporary) as after:
+            before_frames = int(getattr(before, "n_frames", 1))
+            after_frames = int(getattr(after, "n_frames", 1))
+            if before.size != after.size or before_frames != after_frames:
+                raise RuntimeError("输出图片的尺寸或帧数发生变化")
+            after.verify()
+        os.replace(temporary, output)
+        return output
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def valid_existing_png(
     path: Path,
     expected_version: str | None = None,
@@ -1872,7 +2018,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="逐页提取 PDF 图片并进行非生成式、保真的纸张背景清理。"
     )
-    parser.add_argument("pdf", nargs="*", type=Path, help="一个或多个需要处理的 PDF 路径")
+    parser.add_argument("inputs", nargs="*", type=Path, help="一个或多个 PDF/图片路径")
     parser.add_argument("--dpi", type=int, default=300, help="复杂页面回退渲染 DPI，默认300")
     parser.add_argument(
         "--mode",
@@ -1907,6 +2053,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="仅提取时写入指定DPI元数据；JPEG/PNG不重新编码像素",
     )
+    parser.add_argument(
+        "--image-dpi",
+        type=int,
+        default=None,
+        help="将拖入的图片复制为原名-<DPI>dpi.原扩展名，并设置DPI",
+    )
     return parser
 
 
@@ -1923,8 +2075,15 @@ def main() -> int:
             print("提取图片DPI必须在1到65535之间。", file=sys.stderr)
             return 2
         args.extract_only = True
+    if args.image_dpi is not None:
+        if args.image_dpi < 1 or args.image_dpi > 65535:
+            print("图片DPI必须在1到65535之间。", file=sys.stderr)
+            return 2
+        if args.extract_only or args.extract_dpi is not None:
+            print("--image-dpi不能与PDF提取参数同时使用。", file=sys.stderr)
+            return 2
 
-    pending = list(args.pdf)
+    pending = list(args.inputs)
     had_error = False
     first_batch = True
 
@@ -1932,30 +2091,40 @@ def main() -> int:
         if not pending:
             if args.once and not first_batch:
                 break
-            requested = request_pdf_batch()
+            requested = (
+                request_image_batch()
+                if args.image_dpi is not None
+                else request_pdf_batch()
+            )
             if requested is None:
                 print("\n已退出程序。")
                 break
             pending = requested
 
-        print(f"\n本批次共 {len(pending)} 个 PDF。")
-        for batch_index, pdf_path in enumerate(pending, 1):
+        item_kind = "张图片" if args.image_dpi is not None else "个 PDF"
+        print(f"\n本批次共 {len(pending)} {item_kind}。")
+        for batch_index, input_path in enumerate(pending, 1):
             print("\n" + "=" * 72)
             print(f"批次文件 [{batch_index}/{len(pending)}]")
             try:
-                process_pdf(
-                    pdf_path,
-                    args.dpi,
-                    args.mode,
-                    args.overwrite,
-                    args.workers,
-                    args.extract_only,
-                    args.extract_dpi,
-                )
+                if args.image_dpi is not None:
+                    output = convert_image_dpi(input_path, args.image_dpi)
+                    print(f"完成：{input_path.expanduser().resolve()}")
+                    print(f"输出：{output}")
+                else:
+                    process_pdf(
+                        input_path,
+                        args.dpi,
+                        args.mode,
+                        args.overwrite,
+                        args.workers,
+                        args.extract_only,
+                        args.extract_dpi,
+                    )
             except Exception as exc:
                 had_error = True
                 print(f"错误：{exc}", file=sys.stderr)
-                print("已跳过此文件，继续处理本批次的其他 PDF。", file=sys.stderr)
+                print("已跳过此文件，继续处理本批次的其他文件。", file=sys.stderr)
 
         pending = []
         first_batch = False
