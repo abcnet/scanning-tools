@@ -30,7 +30,7 @@ from PIL import Image, ImageOps, PngImagePlugin
 from scipy import ndimage
 
 
-PROCESSOR_VERSION = "26-independent-page-crop"
+PROCESSOR_VERSION = "27-color-page-neutral-edge"
 
 
 def select_pdfs_with_dialog() -> list[Path]:
@@ -375,11 +375,21 @@ def detect_single_sided_neutral_strip_box(
                 if axis == 1
                 else gray[inner_start:inner_stop, :]
             )
+            inner_chroma = (
+                chroma[:, inner_start:inner_stop]
+                if axis == 1
+                else chroma[inner_start:inner_stop, :]
+            )
             if not inner_gray.size:
                 continue
             inner_level = float(np.median(inner_gray))
             edge_share = float(transition_share[depth - 3])
             axis_size = width if axis == 1 else height
+            colorful_inner_band = (
+                edge_share >= 0.75
+                and smooth_gradient_share >= 0.93
+                and float(np.mean(inner_chroma >= 25)) >= 0.25
+            )
             deep_relaxed_band = depth >= max(80, int(axis_size * 0.05))
             dark_shallow_band = (
                 outer_level <= 190.0
@@ -394,6 +404,7 @@ def detect_single_sided_neutral_strip_box(
                     and smooth_gradient_share >= 0.96
                 )
                 or dark_shallow_band
+                or colorful_inner_band
             )
 
             # A gray/black scanner band is materially darker than the page
@@ -403,7 +414,10 @@ def detect_single_sided_neutral_strip_box(
                 neutral_share >= 0.90
                 and texture_evidence
                 and outer_level <= 238.0
-                and inner_level - outer_level >= 12.0
+                and (
+                    inner_level - outer_level >= 12.0
+                    or colorful_inner_band
+                )
             ):
                 return depth
         return 0
@@ -1463,6 +1477,23 @@ ORIGINAL_IMAGE_SUFFIXES = {
 }
 
 
+def find_existing_page_image(directory: Path, stem: str) -> Path | None:
+    """Return an already extracted, readable page image without touching it."""
+    candidates = sorted(
+        (
+            candidate
+            for candidate in directory.glob(f"{stem}.*")
+            if candidate.is_file()
+            and candidate.suffix.lower() in ORIGINAL_IMAGE_SUFFIXES
+        ),
+        key=lambda candidate: candidate.name.lower(),
+    )
+    for candidate in candidates:
+        if valid_existing_png(candidate):
+            return candidate
+    return None
+
+
 def remove_other_page_images(directory: Path, stem: str, keep: Path) -> None:
     """Remove obsolete generated variants such as both 001.png and 001.jpg."""
     for candidate in directory.glob(f"{stem}.*"):
@@ -1750,6 +1781,23 @@ def process_pdf(
 
         for index, page in enumerate(document):
             stem = f"{index + 1:0{digits}d}"
+            existing_path = (
+                None
+                if overwrite
+                else find_existing_page_image(original_dir, stem)
+            )
+            if existing_path is not None:
+                original_paths.append(existing_path)
+                print(
+                    f"[提取 {index + 1:0{digits}d}/{total}] "
+                    f"原图:跳过已有图片({existing_path.suffix.lower().lstrip('.')})",
+                    flush=True,
+                )
+                continue
+
+            # Only inspect/extract the PDF page when this numbered image is
+            # missing or unreadable.  In particular, do not extract the
+            # embedded stream merely to compare it with an existing file.
             embedded = dominant_embedded_image_data(document, page)
 
             if embedded is not None:
