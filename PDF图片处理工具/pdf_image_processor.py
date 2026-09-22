@@ -30,7 +30,7 @@ from PIL import Image, ImageOps, PngImagePlugin
 from scipy import ndimage
 
 
-PROCESSOR_VERSION = "27-color-page-neutral-edge"
+PROCESSOR_VERSION = "33-content-safe-frame"
 
 
 def select_pdfs_with_dialog() -> list[Path]:
@@ -309,6 +309,40 @@ def detect_nested_neutral_frame_box(
         top = nested_transition_depth(0, False, max_y)
     if not bottom_depth:
         bottom_depth = nested_transition_depth(0, True, max_y)
+
+    def reject_bright_page_margin(depth: int, axis: int, reversed_side: bool) -> int:
+        """Reject ordinary white page margins mistaken for a scanner frame.
+
+        A colorful layout can create an almost full-length transition where a
+        photograph or sidebar meets the page's own white margin.  Chroma alone
+        cannot distinguish that margin from a neutral scanner frame.  A real
+        gray/black bed band contains a substantial non-white population;
+        an overwhelmingly paper-white strip must stay with the page so nearby
+        text, page numbers, and diagrams are never clipped.
+        """
+        if not depth:
+            return 0
+        region = (
+            gray[:, width - depth :]
+            if axis == 1 and reversed_side
+            else gray[:, :depth]
+            if axis == 1
+            else gray[height - depth :, :]
+            if reversed_side
+            else gray[:depth, :]
+        )
+        if not region.size:
+            return 0
+        paper_white = float(np.mean(region >= 246.0))
+        nonwhite = float(np.mean(region < 238.0))
+        if float(np.median(region)) >= 246.0 and paper_white >= 0.65 and nonwhite < 0.20:
+            return 0
+        return depth
+
+    left = reject_bright_page_margin(left, 1, False)
+    right_depth = reject_bright_page_margin(right_depth, 1, True)
+    top = reject_bright_page_margin(top, 0, False)
+    bottom_depth = reject_bright_page_margin(bottom_depth, 0, True)
 
     hsv = np.asarray(Image.fromarray(rgb, "RGB").convert("HSV"))
     central_sat = hsv[
@@ -756,9 +790,42 @@ def detect_physical_crop_box(image: Image.Image) -> tuple[int, int, int, int]:
             contained_outside_paper = inward_slice.stop <= max(
                 0, trusted_outer_depth - 3
             )
+            # A scanner-bed joint can be a narrow dark line perpendicular to
+            # a slanted page edge.  It starts at the canvas edge and ends well
+            # before the conservative rectangular crop.  It is not page ink.
+            inward_extent = inward_slice.stop - inward_slice.start
+            cross_extent_component = cross_slice.stop - cross_slice.start
+            narrow_outer_joint = (
+                neutral_seam
+                and meaningful_border_depth
+                and touches_outer
+                and inward_extent >= max(15, int(strip.shape[inward_axis] * 0.25))
+                and inward_slice.stop <= int(strip.shape[inward_axis] * 0.80)
+                and cross_extent_component <= max(12, int(cross_extent * 0.03))
+            )
+
+            # Old paper often has small, pale-yellow foxing exactly where a
+            # slanted sheet enters the scan.  Treat only tiny, very bright
+            # components inside an already confirmed substantial border as
+            # edge discoloration.  Dark ink and saturated annotations remain
+            # protected by the normal content rule below.
+            component_rgb = color_strip[obj][component]
+            component_min_channel = (
+                float(np.median(np.min(component_rgb, axis=1)))
+                if component_rgb.size
+                else 0.0
+            )
+            pale_edge_discoloration = (
+                meaningful_border_depth
+                and component_color_share >= 0.80
+                and component_min_channel >= 205.0
+                and int(sizes[label_id - 1]) <= 500
+            )
             if neutral_seam and meaningful_border_depth and (
                 (spans_side and touches_outer) or contained_outside_paper
             ):
+                continue
+            if narrow_outer_joint or pale_edge_discoloration:
                 continue
             content_components.append(int(label_id))
         significant = np.asarray(content_components, dtype=np.int32)
@@ -1870,7 +1937,26 @@ def process_saved_page(
             original = normalize_image(opened)
         original.load()
     crop_box = detect_physical_crop_box(original)
+    expected_size = (
+        crop_box[2] - crop_box[0],
+        crop_box[3] - crop_box[1],
+    )
     processed = process_image(original, mode, crop_box)
+    if processed.size != expected_size:
+        # A detected crop must never silently produce a full-size output.
+        # Retry from an explicitly cropped source so this invariant also
+        # holds if a future processing branch mishandles crop_box.
+        cropped_source = original.crop(crop_box)
+        processed = process_image(
+            cropped_source,
+            mode,
+            (0, 0, cropped_source.width, cropped_source.height),
+        )
+    if processed.size != expected_size:
+        raise RuntimeError(
+            f"裁边输出尺寸错误：应为{expected_size[0]}x{expected_size[1]}，"
+            f"实际为{processed.width}x{processed.height}"
+        )
     save_png(
         processed,
         processed_path,
@@ -1878,6 +1964,26 @@ def process_saved_page(
         output_version,
         source_sha256,
     )
+    try:
+        with Image.open(processed_path) as written:
+            written.load()
+            written_size = written.size
+            written_version = written.info.get("pdf_image_processor_version")
+            written_source = written.info.get("source_sha256")
+    except Exception as exc:
+        processed_path.unlink(missing_ok=True)
+        raise RuntimeError(f"无法验证已写入的处理图片：{processed_path}") from exc
+    if (
+        written_size != expected_size
+        or written_version != output_version
+        or written_source != source_sha256
+    ):
+        processed_path.unlink(missing_ok=True)
+        raise RuntimeError(
+            f"处理图片落盘校验失败：{processed_path}；"
+            f"应为{expected_size[0]}x{expected_size[1]}，"
+            f"实际为{written_size[0]}x{written_size[1]}"
+        )
     return index, "处理", crop_box
 
 
@@ -1889,6 +1995,7 @@ def process_pdf(
     workers: int,
     extract_only: bool = False,
     extract_dpi: int | None = None,
+    force_process: bool = False,
 ) -> None:
     pdf_path = pdf_path.expanduser().resolve()
     if not pdf_path.is_file() or pdf_path.suffix.lower() != ".pdf":
@@ -1912,6 +2019,7 @@ def process_pdf(
         digits = max(3, len(str(total)))
 
         print(f"PDF：{pdf_path}")
+        print(f"程序版本：{PROCESSOR_VERSION}")
         print(f"页数：{total}")
         print(f"原始图片：{original_dir}")
         print(f"处理图片：{processed_dir}")
@@ -1995,14 +2103,21 @@ def process_pdf(
             processed_dir / f"{index + 1:0{digits}d}.png",
             dpi,
             mode,
-            overwrite,
+            overwrite or force_process,
         )
         for index in range(total)
     ]
     with ThreadPoolExecutor(max_workers=active_workers) as executor:
         results = executor.map(process_saved_page, tasks)
         for index, processed_status, crop_box in results:
-            crop_text = f"；裁切框:{crop_box}" if crop_box is not None else ""
+            crop_text = ""
+            if crop_box is not None:
+                output_width = crop_box[2] - crop_box[0]
+                output_height = crop_box[3] - crop_box[1]
+                crop_text = (
+                    f"；裁切框:{crop_box}"
+                    f"；输出尺寸:{output_width}x{output_height}"
+                )
             print(
                 f"[处理 {index + 1:0{digits}d}/{total}] "
                 f"处理图:{processed_status}{crop_text}",
@@ -2030,6 +2145,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--overwrite",
         action="store_true",
         help="覆盖已存在的逐页图片；默认跳过完整的现有页面，便于断点续跑",
+    )
+    parser.add_argument(
+        "--force-process",
+        action="store_true",
+        help="强制重新生成-processed图片，但仍跳过已存在的原始提取图片",
     )
     parser.add_argument(
         "--workers",
@@ -2120,6 +2240,7 @@ def main() -> int:
                         args.workers,
                         args.extract_only,
                         args.extract_dpi,
+                        args.force_process,
                     )
             except Exception as exc:
                 had_error = True

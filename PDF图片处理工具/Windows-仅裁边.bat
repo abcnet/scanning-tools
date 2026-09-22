@@ -43,7 +43,7 @@ echo Drag one or more PDF files into this window, then press Enter.
 echo Press Enter on an empty line to open the file picker.
 echo After each batch, the program keeps waiting. Type Q to exit.
 echo.
-call %PYTHON_CMD% "%~dp0pdf_image_processor.py" --mode border-only %*
+call %PYTHON_CMD% "%~dp0pdf_image_processor.py" --mode border-only --force-process %*
 if errorlevel 1 goto PROCESS_FAILED
 goto END
 
