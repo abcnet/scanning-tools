@@ -25,7 +25,7 @@ if errorlevel 1 goto NO_PYTHON
 
 echo.
 echo Checking Python packages...
-call %PYTHON_CMD% -c "import fitz, PIL, numpy, scipy" >nul 2>&1
+call %PYTHON_CMD% -c "import pymupdf, PIL, numpy, scipy" >nul 2>&1
 if errorlevel 1 goto INSTALL_DEPS
 goto RUN_PROCESSOR
 

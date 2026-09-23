@@ -24,13 +24,13 @@ import zlib
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-import fitz  # PyMuPDF
+import pymupdf
 import numpy as np
 from PIL import Image, ImageOps, PngImagePlugin
 from scipy import ndimage
 
 
-PROCESSOR_VERSION = "33-content-safe-frame"
+PROCESSOR_VERSION = "34-pymupdf-import"
 
 
 def select_pdfs_with_dialog() -> list[Path]:
@@ -901,7 +901,7 @@ def crop_physical_scanner_borders(image: Image.Image) -> Image.Image:
 
 
 def dominant_embedded_image_data(
-    document: fitz.Document, page: fitz.Page
+    document: pymupdf.Document, page: pymupdf.Page
 ) -> tuple[bytes, str] | None:
     """Return untouched bytes and the extension of a full-page scan image.
 
@@ -949,8 +949,10 @@ def dominant_embedded_image_data(
         return None
 
 
-def render_page_image(page: fitz.Page, dpi: int) -> Image.Image:
-    pixmap = page.get_pixmap(dpi=dpi, colorspace=fitz.csRGB, alpha=False, annots=True)
+def render_page_image(page: pymupdf.Page, dpi: int) -> Image.Image:
+    pixmap = page.get_pixmap(
+        dpi=dpi, colorspace=pymupdf.csRGB, alpha=False, annots=True
+    )
     return normalize_image(Image.frombytes("RGB", (pixmap.width, pixmap.height), pixmap.samples))
 
 
@@ -2012,7 +2014,7 @@ def process_pdf(
 
     original_paths: list[Path] = []
 
-    with fitz.open(pdf_path) as document:
+    with pymupdf.open(pdf_path) as document:
         total = document.page_count
         if total == 0:
             raise RuntimeError("PDF 没有页面。")
