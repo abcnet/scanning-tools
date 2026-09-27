@@ -9,6 +9,7 @@ echo ========================================
 echo.
 
 set "PYTHON_CMD="
+set "SCRIPT_PATH=%~dp0pdf_image_processor.py"
 where py >nul 2>&1
 if errorlevel 1 goto CHECK_PYTHON
 set "PYTHON_CMD=py -3"
@@ -20,12 +21,12 @@ if errorlevel 1 goto NO_PYTHON
 set "PYTHON_CMD=python"
 
 :PYTHON_FOUND
-call %PYTHON_CMD% --version
+%PYTHON_CMD% --version
 if errorlevel 1 goto NO_PYTHON
 
 echo.
 echo Checking Python packages...
-call %PYTHON_CMD% -c "import pymupdf, PIL, numpy, scipy" >nul 2>&1
+%PYTHON_CMD% -c "import pymupdf, PIL, numpy, scipy" >nul 2>&1
 if errorlevel 1 goto INSTALL_DEPS
 goto RUN_PROCESSOR
 
@@ -34,7 +35,7 @@ echo Required packages are missing.
 echo Installing PyMuPDF, Pillow, NumPy and SciPy...
 echo This may take several minutes. Do not close this window.
 echo.
-call %PYTHON_CMD% -m pip install -r "%~dp0requirements.txt"
+%PYTHON_CMD% -m pip install -r "%~dp0requirements.txt"
 if errorlevel 1 goto INSTALL_FAILED
 
 :RUN_PROCESSOR
@@ -43,7 +44,7 @@ echo Drag one or more JPG, PNG, BMP or TIFF images into this window, then press 
 echo Output names use: original-name-600dpi.original-extension
 echo After each batch, the program keeps waiting. Type Q to exit.
 echo.
-call %PYTHON_CMD% "%~dp0pdf_image_processor.py" --image-dpi 600 %*
+%PYTHON_CMD% "%SCRIPT_PATH%" --image-dpi 600 %*
 if errorlevel 1 goto PROCESS_FAILED
 goto END
 

@@ -3,7 +3,7 @@
 
 Outputs beside input.pdf:
   input/001.jpg, 002.jpg, ... (or the actual embedded image format)
-  input-processed/001.png, 002.png, ...
+  input-processed/001.jpg, 002.png, ... (same format as each source image)
 
 The processing is deterministic and non-generative. Dark text, colorful
 content, edges, photographs, and drawings are protected before paper-like
@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import io
+import json
 import os
 import shlex
 import struct
@@ -30,7 +32,7 @@ from PIL import Image, ImageOps, PngImagePlugin
 from scipy import ndimage
 
 
-PROCESSOR_VERSION = "34-pymupdf-import"
+PROCESSOR_VERSION = "40-windows-space-safe-reload"
 
 
 def select_pdfs_with_dialog() -> list[Path]:
@@ -121,6 +123,14 @@ return outputText
 
 
 def parse_dragged_paths(raw: str) -> list[Path]:
+    raw = raw.strip()
+    # A single path pasted or dragged without quotes is still unambiguous when
+    # the complete text names an existing file.  Check it before shlex so a
+    # Windows path such as ``D:\\Scan Files\\book one.pdf`` is not split at its
+    # spaces.  Quoted/multiple paths continue through the normal parser below.
+    whole = raw.strip('"')
+    if whole and Path(whole).expanduser().exists():
+        return [Path(whole)]
     try:
         return [Path(item.strip('"')) for item in shlex.split(raw, posix=os.name != "nt")]
     except ValueError:
@@ -900,6 +910,136 @@ def crop_physical_scanner_borders(image: Image.Image) -> Image.Image:
     return image.crop(box)
 
 
+def refine_bilevel_frame_box(
+    image: Image.Image,
+    box: tuple[int, int, int, int],
+) -> tuple[int, int, int, int]:
+    """Remove long black frame lines close to a 1-bit page's canvas edge.
+
+    General gray-border detection protects long dark rules because they can be
+    intentional layout. On a true bilevel scan, however, a dense line within
+    the outer few percent of the canvas, preceded only by blank scanner area,
+    is a physical scan frame. Horizontal sides require at least half-page
+    coverage; vertical slivers use a lower threshold but must persist for
+    multiple adjacent columns.
+    """
+    if image.mode != "1":
+        return box
+    black = np.asarray(image.convert("L"), dtype=np.uint8) < 128
+    height, width = black.shape
+    row_profile = np.mean(black, axis=1)
+    column_profile = np.mean(black, axis=0)
+
+    def side_depth(
+        profile: np.ndarray,
+        maximum: int,
+        strong_threshold: float,
+    ) -> int:
+        strong = profile[:maximum] >= strong_threshold
+        labels, count = ndimage.label(strong)
+        candidates: list[int] = []
+        for label_id in range(1, count + 1):
+            positions = np.flatnonzero(labels == label_id)
+            if not positions.size:
+                continue
+            peak = float(np.max(profile[positions]))
+            if positions.size >= 2 or peak >= 0.70:
+                candidates.append(int(positions[-1]))
+        if not candidates:
+            return 0
+        end = max(candidates)
+        # Include ragged one-bit fragments immediately inside the solid line.
+        blank_run = 0
+        for position in range(end + 1, min(maximum, end + 20)):
+            if profile[position] < 0.005:
+                blank_run += 1
+                if blank_run >= 3:
+                    break
+            else:
+                end = position
+                blank_run = 0
+        return end + 1
+
+    max_y = max(8, int(height * 0.08))
+    max_x = max(8, int(width * 0.06))
+    top_extra = side_depth(row_profile, max_y, 0.50)
+    bottom_extra = side_depth(row_profile[::-1], max_y, 0.50)
+    left_extra = side_depth(column_profile, max_x, 0.15)
+    right_extra = side_depth(column_profile[::-1], max_x, 0.15)
+
+    left, top, right, bottom = box
+    refined = (
+        max(left, left_extra),
+        max(top, top_extra),
+        min(right, width - right_extra),
+        min(bottom, height - bottom_extra),
+    )
+    if (
+        refined[2] - refined[0] < width * 0.70
+        or refined[3] - refined[1] < height * 0.75
+    ):
+        return box
+    return refined
+
+
+def dominant_embedded_image_candidate(
+    page: pymupdf.Page,
+) -> tuple[int, int, int, int, str] | None:
+    """Return xref, dimensions, bit depth, and color space for a page scan."""
+    page_area = max(page.rect.width * page.rect.height, 1.0)
+    candidates: list[tuple[float, int, int, int, int, int, str]] = []
+
+    for info in page.get_images(full=True):
+        xref, smask, width, height, bpc, colorspace = info[:6]
+        if smask:
+            continue
+        rects = page.get_image_rects(xref)
+        coverage = max(
+            (
+                max(rect.width, 0) * max(rect.height, 0) / page_area
+                for rect in rects
+            ),
+            default=0.0,
+        )
+        candidates.append(
+            (coverage, width * height, xref, width, height, bpc, str(colorspace))
+        )
+
+    if not candidates:
+        return None
+
+    coverage, _pixel_area, xref, width, height, bpc, colorspace = max(candidates)
+    if coverage < 0.82:
+        return None
+
+    page_ratio = page.rect.width / max(page.rect.height, 1.0)
+    image_ratio = width / max(height, 1)
+    rotated_ratio = height / max(width, 1)
+    if abs(rotated_ratio - page_ratio) < abs(image_ratio - page_ratio):
+        # The placement transform determines whether this is 90 or 270
+        # degrees. Render the visible page instead of guessing.
+        return None
+    return xref, width, height, bpc, colorspace
+
+
+def expected_embedded_suffixes(
+    document: pymupdf.Document,
+    candidate: tuple[int, int, int, int, str] | None,
+) -> set[str] | None:
+    """Return the only acceptable existing extraction suffixes when known."""
+    if candidate is None:
+        return None
+    xref, _width, _height, bpc, colorspace = candidate
+    if bpc == 1 and colorspace == "DeviceGray":
+        return {".tif", ".tiff"}
+    filter_value = document.xref_get_key(xref, "Filter")[1]
+    if "DCTDecode" in filter_value:
+        return {".jpg", ".jpeg"}
+    if "JPXDecode" in filter_value:
+        return {".jp2", ".jpx"}
+    return None
+
+
 def dominant_embedded_image_data(
     document: pymupdf.Document, page: pymupdf.Page
 ) -> tuple[bytes, str] | None:
@@ -908,35 +1048,12 @@ def dominant_embedded_image_data(
     Complex PDFs, masked images, or pages with no dominant raster image fall
     back to rendering, which preserves their visible page appearance.
     """
-    page_area = max(page.rect.width * page.rect.height, 1.0)
-    candidates: list[tuple[float, int, int, int, int]] = []
-
-    for info in page.get_images(full=True):
-        xref, smask, width, height = info[0], info[1], info[2], info[3]
-        if smask:
-            continue
-        rects = page.get_image_rects(xref)
-        coverage = max(
-            (max(rect.width, 0) * max(rect.height, 0) / page_area for rect in rects),
-            default=0.0,
-        )
-        candidates.append((coverage, width * height, xref, width, height))
-
-    if not candidates:
+    candidate = dominant_embedded_image_candidate(page)
+    if candidate is None:
         return None
-
-    coverage, _pixel_area, xref, width, height = max(candidates)
-    if coverage < 0.82:
-        return None
+    xref, width, height, bpc, colorspace = candidate
 
     try:
-        page_ratio = page.rect.width / max(page.rect.height, 1.0)
-        image_ratio = width / max(height, 1)
-        rotated_ratio = height / max(width, 1)
-        if abs(rotated_ratio - page_ratio) < abs(image_ratio - page_ratio):
-            # The placement transform determines whether this is 90 or 270
-            # degrees. Render the visible page instead of guessing.
-            return None
         extracted = document.extract_image(xref)
         payload = extracted["image"]
         extension = str(extracted.get("ext", "bin")).lower().lstrip(".")
@@ -944,6 +1061,29 @@ def dominant_embedded_image_data(
             extension = "jpg"
         if not payload or not extension or extension == "bin":
             return None
+        if bpc == 1 and colorspace == "DeviceGray":
+            # PyMuPDF decodes CCITT/JBIG2 bilevel streams to an 8-bit L-mode
+            # PNG. Restore the source bit depth and store it as Group 4 TIFF,
+            # the compact standard standalone container for fax-compressed
+            # monochrome pages.
+            with Image.open(io.BytesIO(payload)) as decoded:
+                bilevel = decoded.convert("1", dither=Image.Dither.NONE)
+                encoded = io.BytesIO()
+                rects = page.get_image_rects(xref)
+                dominant_rect = max(
+                    rects,
+                    key=lambda rect: max(rect.width, 0) * max(rect.height, 0),
+                )
+                x_dpi = int(round(width * 72.0 / max(dominant_rect.width, 1.0)))
+                y_dpi = int(round(height * 72.0 / max(dominant_rect.height, 1.0)))
+                bilevel.save(
+                    encoded,
+                    "TIFF",
+                    compression="group4",
+                    dpi=(x_dpi, y_dpi),
+                )
+                payload = encoded.getvalue()
+            extension = "tif"
         return payload, extension
     except Exception:
         return None
@@ -1501,6 +1641,136 @@ def save_png(
         temporary.unlink(missing_ok=True)
 
 
+def processed_state_path(path: Path) -> Path:
+    return path.with_name(f".{path.name}.pdf-image-processor.json")
+
+
+def valid_existing_processed(
+    path: Path,
+    expected_version: str,
+    expected_source_sha256: str,
+) -> bool:
+    if not valid_existing_png(path):
+        return False
+    state_path = processed_state_path(path)
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        return (
+            state.get("processor_version") == expected_version
+            and state.get("source_sha256") == expected_source_sha256
+            and state.get("output_name") == path.name
+        )
+    except Exception:
+        return False
+
+
+def write_processed_state(
+    path: Path,
+    processor_version: str,
+    source_sha256: str,
+) -> None:
+    state_path = processed_state_path(path)
+    handle = tempfile.NamedTemporaryFile(
+        prefix=f".{path.name}-state-",
+        suffix=".json",
+        dir=path.parent,
+        delete=False,
+    )
+    temporary = Path(handle.name)
+    try:
+        payload = json.dumps(
+            {
+                "processor_version": processor_version,
+                "source_sha256": source_sha256,
+                "output_name": path.name,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        handle.write(payload)
+        handle.flush()
+        os.fsync(handle.fileno())
+        handle.close()
+        os.replace(temporary, state_path)
+    finally:
+        if not handle.closed:
+            handle.close()
+        temporary.unlink(missing_ok=True)
+
+
+def save_processed_image(
+    image: Image.Image,
+    path: Path,
+    dpi: int,
+    source_format: str,
+    source_info: dict[str, object],
+    source_quantization: object | None = None,
+    source_layer: object | None = None,
+    processor_version: str | None = None,
+    source_sha256: str | None = None,
+) -> None:
+    """Atomically save a processed page in the source image's format."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    normalized_format = source_format.upper()
+    if normalized_format == "JPG":
+        normalized_format = "JPEG"
+    if normalized_format in {"JP2", "JPX"}:
+        normalized_format = "JPEG2000"
+    if normalized_format in {"PBM", "PGM", "PPM"}:
+        normalized_format = "PPM"
+
+    handle = tempfile.NamedTemporaryFile(
+        prefix=f".{path.stem}-", suffix=path.suffix, dir=path.parent, delete=False
+    )
+    temporary = Path(handle.name)
+    handle.close()
+    try:
+        if normalized_format == "PNG":
+            save_png(
+                image,
+                temporary,
+                dpi,
+                processor_version,
+                source_sha256,
+            )
+            os.replace(temporary, path)
+        else:
+            save_options: dict[str, object] = {
+                "dpi": source_info.get("dpi", (dpi, dpi)),
+            }
+            icc_profile = source_info.get("icc_profile")
+            if icc_profile:
+                save_options["icc_profile"] = icc_profile
+            exif = source_info.get("exif")
+            if exif:
+                save_options["exif"] = exif
+
+            if normalized_format == "JPEG":
+                # Reuse the source quantization tables and chroma sampling.
+                # Cropping a JPEG at arbitrary pixel coordinates necessarily
+                # recomputes DCT blocks, but this avoids an unrelated quality
+                # or compression-policy change.
+                image.format = "JPEG"
+                image.info = dict(source_info)
+                if source_quantization is not None:
+                    image.quantization = source_quantization
+                if source_layer is not None:
+                    image.layer = source_layer
+                save_options["quality"] = "keep"
+                save_options["subsampling"] = "keep"
+            elif normalized_format == "TIFF":
+                compression = source_info.get("compression")
+                if compression:
+                    save_options["compression"] = compression
+
+            image.save(temporary, normalized_format, **save_options)
+            with Image.open(temporary) as check:
+                check.verify()
+            os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def set_jpeg_dpi_metadata(path: Path, dpi: int) -> None:
     """Set JFIF density without decoding or recompressing JPEG pixels."""
     data = bytearray(path.read_bytes())
@@ -1578,6 +1848,35 @@ def set_image_dpi_metadata(path: Path, dpi: int) -> None:
         set_jpeg_dpi_metadata(path, dpi)
     elif suffix == ".png":
         set_png_dpi_metadata(path, dpi)
+    elif suffix in {".tif", ".tiff"}:
+        with Image.open(path) as opened:
+            opened.load()
+            image = opened.copy()
+            source_mode = opened.mode
+            source_size = opened.size
+            source_pixels = opened.tobytes()
+            compression = opened.info.get("compression")
+        handle = tempfile.NamedTemporaryFile(
+            prefix=f".{path.stem}-", suffix=path.suffix, dir=path.parent, delete=False
+        )
+        temporary = Path(handle.name)
+        handle.close()
+        try:
+            save_options: dict[str, object] = {"dpi": (dpi, dpi)}
+            if compression:
+                save_options["compression"] = compression
+            image.save(temporary, "TIFF", **save_options)
+            with Image.open(temporary) as check:
+                check.load()
+                if (
+                    check.mode != source_mode
+                    or check.size != source_size
+                    or check.tobytes() != source_pixels
+                ):
+                    raise RuntimeError(f"TIFF写入DPI后像素发生变化：{path}")
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
     else:
         raise RuntimeError(
             f"无法在不重新编码像素的前提下为{suffix or '未知格式'}写入DPI：{path}"
@@ -1927,18 +2226,25 @@ def process_saved_page(
         if mode == "border-only"
         else PROCESSOR_VERSION
     )
-    if not overwrite and valid_existing_png(
+    if not overwrite and valid_existing_processed(
         processed_path, output_version, source_sha256
     ):
         return index, "跳过", None
 
     with Image.open(original_path) as opened:
+        source_format = opened.format or original_path.suffix.lstrip(".")
+        source_info = dict(opened.info)
+        source_quantization = getattr(opened, "quantization", None)
+        source_layer = getattr(opened, "layer", None)
+        source_size = opened.size
         if mode == "border-only":
             original = ImageOps.exif_transpose(opened)
         else:
             original = normalize_image(opened)
         original.load()
     crop_box = detect_physical_crop_box(original)
+    if mode == "border-only" and original.mode == "1":
+        crop_box = refine_bilevel_frame_box(original, crop_box)
     expected_size = (
         crop_box[2] - crop_box[0],
         crop_box[3] - crop_box[1],
@@ -1959,33 +2265,86 @@ def process_saved_page(
             f"裁边输出尺寸错误：应为{expected_size[0]}x{expected_size[1]}，"
             f"实际为{processed.width}x{processed.height}"
         )
-    save_png(
-        processed,
-        processed_path,
-        dpi,
-        output_version,
-        source_sha256,
+    exact_unchanged_copy = (
+        mode == "border-only"
+        and crop_box == (0, 0, original.width, original.height)
+        and source_size == original.size
     )
+    if exact_unchanged_copy:
+        handle = tempfile.NamedTemporaryFile(
+            prefix=f".{processed_path.stem}-",
+            suffix=processed_path.suffix,
+            dir=processed_path.parent,
+            delete=False,
+        )
+        temporary = Path(handle.name)
+        try:
+            handle.write(original_path.read_bytes())
+            handle.flush()
+            os.fsync(handle.fileno())
+            handle.close()
+            with Image.open(temporary) as check:
+                check.verify()
+            os.replace(temporary, processed_path)
+        finally:
+            if not handle.closed:
+                handle.close()
+            temporary.unlink(missing_ok=True)
+    else:
+        save_processed_image(
+            processed,
+            processed_path,
+            dpi,
+            source_format,
+            source_info,
+            source_quantization,
+            source_layer,
+            output_version,
+            source_sha256,
+        )
     try:
         with Image.open(processed_path) as written:
             written.load()
             written_size = written.size
-            written_version = written.info.get("pdf_image_processor_version")
-            written_source = written.info.get("source_sha256")
+            written_mode = written.mode
+            written_format = written.format
     except Exception as exc:
         processed_path.unlink(missing_ok=True)
+        processed_state_path(processed_path).unlink(missing_ok=True)
         raise RuntimeError(f"无法验证已写入的处理图片：{processed_path}") from exc
+    expected_format = source_format.upper()
+    if expected_format == "JPG":
+        expected_format = "JPEG"
+    if expected_format in {"JP2", "JPX"}:
+        expected_format = "JPEG2000"
+    if expected_format in {"PBM", "PGM", "PPM"}:
+        expected_format = "PPM"
     if (
         written_size != expected_size
-        or written_version != output_version
-        or written_source != source_sha256
+        or (mode == "border-only" and original.mode == "1" and written_mode != "1")
+        or written_format != expected_format
     ):
         processed_path.unlink(missing_ok=True)
+        processed_state_path(processed_path).unlink(missing_ok=True)
         raise RuntimeError(
             f"处理图片落盘校验失败：{processed_path}；"
             f"应为{expected_size[0]}x{expected_size[1]}，"
-            f"实际为{written_size[0]}x{written_size[1]}"
+            f"实际为{written_size[0]}x{written_size[1]}；"
+            f"输入/输出模式={original.mode}/{written_mode}；"
+            f"输入/输出格式={expected_format}/{written_format}"
         )
+    write_processed_state(
+        processed_path,
+        output_version,
+        source_sha256,
+    )
+    remove_other_page_images(processed_path.parent, processed_path.stem, processed_path)
+    current_state = processed_state_path(processed_path)
+    for stale_state in processed_path.parent.glob(
+        f".{processed_path.stem}.*.pdf-image-processor.json"
+    ):
+        if stale_state != current_state:
+            stale_state.unlink(missing_ok=True)
     return index, "处理", crop_box
 
 
@@ -2009,7 +2368,7 @@ def process_pdf(
     processed_dir.mkdir(exist_ok=True)
     # Remove only our own abandoned atomic-write files from an earlier
     # interruption. Numbered page outputs and every other user file remain.
-    for temporary in processed_dir.glob(".[0-9]*-*.png"):
+    for temporary in processed_dir.glob(".[0-9]*-*"):
         temporary.unlink(missing_ok=True)
 
     original_paths: list[Path] = []
@@ -2042,6 +2401,32 @@ def process_pdf(
                 if overwrite
                 else find_existing_page_image(original_dir, stem)
             )
+            candidate = dominant_embedded_image_candidate(page)
+            source_is_bilevel = bool(
+                candidate is not None
+                and candidate[3] == 1
+                and candidate[4] == "DeviceGray"
+            )
+            expected_suffixes = expected_embedded_suffixes(document, candidate)
+            if (
+                existing_path is not None
+                and expected_suffixes is not None
+                and existing_path.suffix.lower() not in expected_suffixes
+            ):
+                # Repair directories created by older releases: a JPEG source
+                # must not remain represented by an old PNG, and a CCITT page
+                # must be replaced by the compact Group 4 TIFF representation.
+                existing_path = None
+            if existing_path is not None and source_is_bilevel:
+                try:
+                    with Image.open(existing_path) as existing_image:
+                        compression = str(
+                            existing_image.info.get("compression", "")
+                        ).lower()
+                        if existing_image.mode != "1" or compression != "group4":
+                            existing_path = None
+                except Exception:
+                    existing_path = None
             if existing_path is not None:
                 original_paths.append(existing_path)
                 print(
@@ -2064,6 +2449,13 @@ def process_pdf(
                     original_status = f"原始流({extension})"
                 else:
                     original_status = f"沿用原始流({extension})"
+                if source_is_bilevel:
+                    with Image.open(original_path) as extracted_check:
+                        if extracted_check.mode != "1":
+                            raise RuntimeError(
+                                f"1-bit黑白页提取后色深错误：{original_path}"
+                            )
+                    original_status = "无损1-bit Group4 TIFF"
             else:
                 original_path = original_dir / f"{stem}.png"
                 if overwrite or not valid_existing_png(original_path):
@@ -2102,7 +2494,8 @@ def process_pdf(
         (
             index,
             original_paths[index],
-            processed_dir / f"{index + 1:0{digits}d}.png",
+            processed_dir
+            / f"{index + 1:0{digits}d}{original_paths[index].suffix.lower()}",
             dpi,
             mode,
             overwrite or force_process,
@@ -2125,7 +2518,7 @@ def process_pdf(
                 f"处理图:{processed_status}{crop_text}",
                 flush=True,
             )
-    for temporary in processed_dir.glob(".[0-9]*-*.png"):
+    for temporary in processed_dir.glob(".[0-9]*-*"):
         temporary.unlink(missing_ok=True)
 
     print("\n完成。请先抽查文字、手写内容、灰色图形和黄色插图，再导入 Epson DCP。")
@@ -2221,6 +2614,46 @@ def main() -> int:
             if requested is None:
                 print("\n已退出程序。")
                 break
+            if not args.once:
+                # The long-running launcher may have been left open while this
+                # .py file was replaced by an update.  Process each requested
+                # batch in a fresh one-shot child interpreter, so it always
+                # reads the current file from disk.  Do not use os.execv here:
+                # on Windows/Python 3.14 an interpreter installed below a path
+                # containing spaces (for example D:\\Program Files\\...) can be
+                # split at the first space during exec, losing the script name.
+                reload_arguments = [
+                    sys.executable,
+                    str(Path(__file__).resolve()),
+                    "--once",
+                    "--dpi",
+                    str(args.dpi),
+                    "--mode",
+                    args.mode,
+                    "--workers",
+                    str(args.workers),
+                ]
+                if args.overwrite:
+                    reload_arguments.append("--overwrite")
+                if args.force_process:
+                    reload_arguments.append("--force-process")
+                if args.extract_only:
+                    reload_arguments.append("--extract-only")
+                if args.extract_dpi is not None:
+                    reload_arguments.extend(("--extract-dpi", str(args.extract_dpi)))
+                if args.image_dpi is not None:
+                    reload_arguments.extend(("--image-dpi", str(args.image_dpi)))
+                reload_arguments.extend(str(path) for path in requested)
+                completed = subprocess.run(reload_arguments, shell=False, check=False)
+                if completed.returncode != 0:
+                    had_error = True
+                    print(
+                        f"\n本批次处理失败，子进程退出码：{completed.returncode}",
+                        file=sys.stderr,
+                    )
+                first_batch = False
+                print("\n本批次处理完毕。程序继续等待下一批 PDF。")
+                continue
             pending = requested
 
         item_kind = "张图片" if args.image_dpi is not None else "个 PDF"
