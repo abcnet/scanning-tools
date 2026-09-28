@@ -23,7 +23,8 @@ import subprocess
 import sys
 import tempfile
 import zlib
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from multiprocessing import get_context
 from pathlib import Path
 
 import pymupdf
@@ -32,7 +33,7 @@ from PIL import Image, ImageOps, PngImagePlugin
 from scipy import ndimage
 
 
-PROCESSOR_VERSION = "41-gradual-neutral-color-edge"
+PROCESSOR_VERSION = "42-parallel-pdf-extraction"
 
 
 def select_pdfs_with_dialog() -> list[Path]:
@@ -2441,6 +2442,148 @@ def process_saved_page(
     return index, "处理", crop_box
 
 
+def extract_pdf_page_range(
+    task: tuple[str, tuple[int, ...], str, int, int, bool, int | None],
+) -> list[tuple[int, str | None, str | None, str | None]]:
+    """Extract one page range in an independent process and PDF document.
+
+    PyMuPDF document objects are deliberately never shared between workers.
+    Each result contains page index, output path, status text, and an optional
+    error.  A failed page does not stop the remaining pages in this range, so
+    an interrupted or partially bad PDF remains resumable.
+    """
+    (
+        pdf_path_text,
+        page_indices,
+        original_dir_text,
+        digits,
+        dpi,
+        overwrite,
+        extract_dpi,
+    ) = task
+    pdf_path = Path(pdf_path_text)
+    original_dir = Path(original_dir_text)
+    results: list[tuple[int, str | None, str | None, str | None]] = []
+
+    with pymupdf.open(pdf_path) as document:
+        total = document.page_count
+        for index in page_indices:
+            stem = f"{index + 1:0{digits}d}"
+            try:
+                page = document[index]
+                existing_path = (
+                    None
+                    if overwrite
+                    else find_existing_page_image(original_dir, stem)
+                )
+                candidate = dominant_embedded_image_candidate(page)
+                source_is_bilevel = bool(
+                    candidate is not None
+                    and candidate[3] == 1
+                    and candidate[4] == "DeviceGray"
+                )
+                expected_suffixes = expected_embedded_suffixes(document, candidate)
+                if (
+                    existing_path is not None
+                    and expected_suffixes is not None
+                    and existing_path.suffix.lower() not in expected_suffixes
+                ):
+                    # Repair outputs from releases that used PNG for JPEG or
+                    # for compact one-bit CCITT/JBIG2 pages.
+                    existing_path = None
+                if existing_path is not None and source_is_bilevel:
+                    try:
+                        with Image.open(existing_path) as existing_image:
+                            compression = str(
+                                existing_image.info.get("compression", "")
+                            ).lower()
+                            if (
+                                existing_image.mode != "1"
+                                or compression != "group4"
+                            ):
+                                existing_path = None
+                    except Exception:
+                        existing_path = None
+                if existing_path is not None:
+                    status = (
+                        "跳过已有图片"
+                        f"({existing_path.suffix.lower().lstrip('.')})"
+                    )
+                    results.append((index, str(existing_path), status, None))
+                    print(
+                        f"[提取 {index + 1:0{digits}d}/{total}] 原图:{status}",
+                        flush=True,
+                    )
+                    continue
+
+                # Inspect/decode only when this numbered page image is absent
+                # or invalid.  Different processes always write different
+                # page stems, so no output file is shared between workers.
+                embedded = dominant_embedded_image_data(document, page)
+                if embedded is not None:
+                    payload, extension = embedded
+                    original_path = original_dir / f"{stem}.{extension}"
+                    if (
+                        overwrite
+                        or not original_path.is_file()
+                        or original_path.read_bytes() != payload
+                    ):
+                        original_path.write_bytes(payload)
+                        original_status = f"原始流({extension})"
+                    else:
+                        original_status = f"沿用原始流({extension})"
+                    if source_is_bilevel:
+                        with Image.open(original_path) as extracted_check:
+                            if extracted_check.mode != "1":
+                                raise RuntimeError(
+                                    f"1-bit黑白页提取后色深错误：{original_path}"
+                                )
+                        original_status = "无损1-bit Group4 TIFF"
+                else:
+                    original_path = original_dir / f"{stem}.png"
+                    if overwrite or not valid_existing_png(original_path):
+                        rendered = render_page_image(page, dpi)
+                        save_png(rendered, original_path, dpi)
+                        original_status = "渲染PNG"
+                    else:
+                        original_status = "沿用渲染PNG"
+
+                if extract_dpi is not None:
+                    set_image_dpi_metadata(original_path, extract_dpi)
+                    original_status += f"；DPI={extract_dpi}"
+
+                remove_other_page_images(original_dir, stem, original_path)
+                results.append((index, str(original_path), original_status, None))
+                print(
+                    f"[提取 {index + 1:0{digits}d}/{total}] "
+                    f"原图:{original_status}",
+                    flush=True,
+                )
+            except Exception as exc:
+                message = f"{type(exc).__name__}: {exc}"
+                results.append((index, None, None, message))
+                print(
+                    f"[提取 {index + 1:0{digits}d}/{total}] 错误:{message}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+    return results
+
+
+def split_page_ranges(total: int, workers: int) -> list[tuple[int, ...]]:
+    """Split pages into balanced contiguous ranges, one per worker process."""
+    active = min(max(1, workers), total)
+    quotient, remainder = divmod(total, active)
+    ranges: list[tuple[int, ...]] = []
+    start = 0
+    for worker_index in range(active):
+        count = quotient + (1 if worker_index < remainder else 0)
+        stop = start + count
+        ranges.append(tuple(range(start, stop)))
+        start = stop
+    return ranges
+
+
 def process_pdf(
     pdf_path: Path,
     dpi: int,
@@ -2464,111 +2607,88 @@ def process_pdf(
     for temporary in processed_dir.glob(".[0-9]*-*"):
         temporary.unlink(missing_ok=True)
 
-    original_paths: list[Path] = []
-
     with pymupdf.open(pdf_path) as document:
         total = document.page_count
         if total == 0:
             raise RuntimeError("PDF 没有页面。")
         digits = max(3, len(str(total)))
 
-        print(f"PDF：{pdf_path}")
-        print(f"程序版本：{PROCESSOR_VERSION}")
-        print(f"页数：{total}")
-        print(f"原始图片：{original_dir}")
-        print(f"处理图片：{processed_dir}")
-        if extract_only:
-            if extract_dpi is not None:
-                print(f"模式：仅提取原图，并写入{extract_dpi} DPI元数据；不处理图片\n")
-            else:
-                print("模式：仅提取原图，不处理图片\n")
-            print("提取并保存原始页面", flush=True)
+    extraction_workers = min(workers, total)
+    print(f"PDF：{pdf_path}")
+    print(f"程序版本：{PROCESSOR_VERSION}")
+    print(f"页数：{total}")
+    print(f"原始图片：{original_dir}")
+    print(f"处理图片：{processed_dir}")
+    if extract_only:
+        if extract_dpi is not None:
+            print(f"模式：仅提取原图，并写入{extract_dpi} DPI元数据；不处理图片\n")
         else:
-            print(f"模式：{mode}\n")
-            print("阶段 1/2：提取并保存全部原始页面", flush=True)
+            print("模式：仅提取原图，不处理图片\n")
+        print(
+            f"并行提取并保存原始页面（{extraction_workers}个独立进程）",
+            flush=True,
+        )
+    else:
+        print(f"模式：{mode}\n")
+        print(
+            f"阶段 1/2：并行提取并保存全部原始页面"
+            f"（{extraction_workers}个独立进程）",
+            flush=True,
+        )
 
-        for index, page in enumerate(document):
-            stem = f"{index + 1:0{digits}d}"
-            existing_path = (
-                None
-                if overwrite
-                else find_existing_page_image(original_dir, stem)
-            )
-            candidate = dominant_embedded_image_candidate(page)
-            source_is_bilevel = bool(
-                candidate is not None
-                and candidate[3] == 1
-                and candidate[4] == "DeviceGray"
-            )
-            expected_suffixes = expected_embedded_suffixes(document, candidate)
-            if (
-                existing_path is not None
-                and expected_suffixes is not None
-                and existing_path.suffix.lower() not in expected_suffixes
-            ):
-                # Repair directories created by older releases: a JPEG source
-                # must not remain represented by an old PNG, and a CCITT page
-                # must be replaced by the compact Group 4 TIFF representation.
-                existing_path = None
-            if existing_path is not None and source_is_bilevel:
-                try:
-                    with Image.open(existing_path) as existing_image:
-                        compression = str(
-                            existing_image.info.get("compression", "")
-                        ).lower()
-                        if existing_image.mode != "1" or compression != "group4":
-                            existing_path = None
-                except Exception:
-                    existing_path = None
-            if existing_path is not None:
-                original_paths.append(existing_path)
-                print(
-                    f"[提取 {index + 1:0{digits}d}/{total}] "
-                    f"原图:跳过已有图片({existing_path.suffix.lower().lstrip('.')})",
-                    flush=True,
-                )
-                continue
+    range_tasks = [
+        (
+            str(pdf_path),
+            page_range,
+            str(original_dir),
+            digits,
+            dpi,
+            overwrite,
+            extract_dpi,
+        )
+        for page_range in split_page_ranges(total, extraction_workers)
+    ]
+    if extraction_workers == 1:
+        grouped_results = [extract_pdf_page_range(range_tasks[0])]
+    else:
+        # Use fresh spawned interpreters on every platform.  This matches
+        # Windows/macOS behavior and avoids inheriting an already initialized
+        # MuPDF runtime through fork on Linux.
+        with ProcessPoolExecutor(
+            max_workers=extraction_workers,
+            mp_context=get_context("spawn"),
+        ) as executor:
+            grouped_results = list(executor.map(extract_pdf_page_range, range_tasks))
 
-            # Only inspect/extract the PDF page when this numbered image is
-            # missing or unreadable.  In particular, do not extract the
-            # embedded stream merely to compare it with an existing file.
-            embedded = dominant_embedded_image_data(document, page)
-
-            if embedded is not None:
-                payload, extension = embedded
-                original_path = original_dir / f"{stem}.{extension}"
-                if overwrite or not original_path.is_file() or original_path.read_bytes() != payload:
-                    original_path.write_bytes(payload)
-                    original_status = f"原始流({extension})"
-                else:
-                    original_status = f"沿用原始流({extension})"
-                if source_is_bilevel:
-                    with Image.open(original_path) as extracted_check:
-                        if extracted_check.mode != "1":
-                            raise RuntimeError(
-                                f"1-bit黑白页提取后色深错误：{original_path}"
-                            )
-                    original_status = "无损1-bit Group4 TIFF"
-            else:
-                original_path = original_dir / f"{stem}.png"
-                if overwrite or not valid_existing_png(original_path):
-                    rendered = render_page_image(page, dpi)
-                    save_png(rendered, original_path, dpi)
-                    original_status = "渲染PNG"
-                else:
-                    original_status = "沿用渲染PNG"
-
-            if extract_dpi is not None:
-                set_image_dpi_metadata(original_path, extract_dpi)
-                original_status += f"；DPI={extract_dpi}"
-
-            remove_other_page_images(original_dir, stem, original_path)
-            original_paths.append(original_path)
-
-            print(
-                f"[提取 {index + 1:0{digits}d}/{total}] 原图:{original_status}",
-                flush=True,
-            )
+    page_results = sorted(
+        (result for group in grouped_results for result in group),
+        key=lambda result: result[0],
+    )
+    extraction_errors = [result for result in page_results if result[3] is not None]
+    if extraction_errors:
+        summary = "；".join(
+            f"第{index + 1}页: {error}"
+            for index, _path, _status, error in extraction_errors[:8]
+        )
+        if len(extraction_errors) > 8:
+            summary += f"；另有{len(extraction_errors) - 8}页错误"
+        raise RuntimeError(
+            f"有{len(extraction_errors)}页提取失败；其余页面已经保存，可重新运行续传。"
+            f"\n{summary}"
+        )
+    if len(page_results) != total:
+        raise RuntimeError(
+            f"提取结果页数错误：应为{total}页，实际为{len(page_results)}页"
+        )
+    original_paths = [
+        Path(path_text)
+        for _index, path_text, _status, _error in page_results
+        if path_text is not None
+    ]
+    if len(original_paths) != total:
+        raise RuntimeError(
+            f"有效提取图片数错误：应为{total}张，实际为{len(original_paths)}张"
+        )
 
     if extract_only:
         print("\n完成：只提取原图；-processed 目录保持不处理。", flush=True)
@@ -2643,7 +2763,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--workers",
         type=int,
         default=min(8, max(1, os.cpu_count() or 1)),
-        help="并行处理图片的线程数，默认自动选择且最多8个；内存不足可设为1、2或4",
+        help=(
+            "PDF提取进程数及图片处理线程数，默认自动选择且最多8个；"
+            "内存不足可设为1、2或4"
+        ),
     )
     parser.add_argument(
         "--once",
@@ -2676,7 +2799,7 @@ def main() -> int:
         print("DPI 必须在72到1200之间。", file=sys.stderr)
         return 2
     if args.workers < 1 or args.workers > 32:
-        print("工作线程数必须在1到32之间。", file=sys.stderr)
+        print("并行工作数必须在1到32之间。", file=sys.stderr)
         return 2
     if args.extract_dpi is not None:
         if args.extract_dpi < 1 or args.extract_dpi > 65535:
