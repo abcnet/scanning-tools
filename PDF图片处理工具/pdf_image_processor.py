@@ -32,7 +32,7 @@ from PIL import Image, ImageOps, PngImagePlugin
 from scipy import ndimage
 
 
-PROCESSOR_VERSION = "40-windows-space-safe-reload"
+PROCESSOR_VERSION = "41-gradual-neutral-color-edge"
 
 
 def select_pdfs_with_dialog() -> list[Path]:
@@ -421,6 +421,102 @@ def detect_single_sided_neutral_strip_box(
         delta = np.linalg.norm(smooth[6:] - smooth[:-6], axis=2)
         return np.mean(delta >= 20.0, axis=1)
 
+    def gradual_neutral_to_color_depth(
+        axis: int,
+        reverse: bool,
+        maximum: int,
+    ) -> int:
+        """Detect a neutral scanner strip meeting a full-bleed colored page.
+
+        A soft scanner shadow can turn into the page over roughly ten pixels,
+        so no single row or column reaches the normal strong-transition
+        threshold.  This fallback instead requires a broad, non-white neutral
+        outer band followed by sustained chromatic page pixels.  Bright white
+        page margins and images already colored at the canvas edge cannot
+        qualify.
+        """
+        chroma = np.flip(base_chroma, axis=axis) if reverse else base_chroma
+        gray = np.flip(base_gray, axis=axis) if reverse else base_gray
+        axis_size = width if axis == 1 else height
+        cross_axis = 1 - axis
+        baseline_depth = max(5, min(maximum // 4, int(axis_size * 0.012)))
+        outer_baseline_chroma = (
+            chroma[:, :baseline_depth]
+            if axis == 1
+            else chroma[:baseline_depth, :]
+        )
+        if (
+            not outer_baseline_chroma.size
+            or float(np.mean(outer_baseline_chroma <= 15)) < 0.94
+        ):
+            return 0
+
+        color_share = np.mean(chroma >= 25, axis=cross_axis)
+        neutral_share = np.mean(chroma <= 15, axis=cross_axis)
+        smooth_color = ndimage.uniform_filter1d(
+            color_share.astype(np.float32), size=5, mode="nearest"
+        )
+        smooth_neutral = ndimage.uniform_filter1d(
+            neutral_share.astype(np.float32), size=5, mode="nearest"
+        )
+        minimum_depth = max(8, int(axis_size * 0.012))
+        candidates = np.flatnonzero(
+            (smooth_color >= 0.55) & (smooth_neutral <= 0.20)
+        )
+        candidates = candidates[
+            (candidates >= minimum_depth) & (candidates < maximum)
+        ]
+
+        for depth_value in candidates:
+            depth = int(depth_value)
+            outer_stop = max(3, depth - 5)
+            outer_chroma = (
+                chroma[:, :outer_stop]
+                if axis == 1
+                else chroma[:outer_stop, :]
+            )
+            outer_gray = (
+                gray[:, :outer_stop]
+                if axis == 1
+                else gray[:outer_stop, :]
+            )
+            inner_stop = min(
+                axis_size,
+                depth + max(12, int(axis_size * 0.02)),
+            )
+            inner_chroma = (
+                chroma[:, depth:inner_stop]
+                if axis == 1
+                else chroma[depth:inner_stop, :]
+            )
+            if not outer_gray.size or not inner_chroma.size:
+                continue
+
+            gradient_inward = np.abs(np.diff(outer_gray, axis=axis))
+            gradient_cross = np.abs(np.diff(outer_gray, axis=cross_axis))
+            smooth_outer = min(
+                float(np.mean(gradient_inward < 12.0))
+                if gradient_inward.size
+                else 1.0,
+                float(np.mean(gradient_cross < 12.0))
+                if gradient_cross.size
+                else 1.0,
+            )
+            outer_level = float(np.median(outer_gray))
+            outer_chroma_level = float(np.median(outer_chroma))
+            inner_chroma_level = float(np.median(inner_chroma))
+
+            if (
+                float(np.mean(outer_chroma <= 15)) >= 0.94
+                and smooth_outer >= 0.95
+                and outer_level <= 238.0
+                and float(np.mean(outer_gray >= 246.0)) < 0.35
+                and float(np.mean(inner_chroma >= 25)) >= 0.55
+                and inner_chroma_level - outer_chroma_level >= 10.0
+            ):
+                return depth
+        return 0
+
     def depth_for_side(
         axis: int,
         reverse: bool,
@@ -430,9 +526,6 @@ def detect_single_sided_neutral_strip_box(
         candidates = np.flatnonzero(
             transition_share[: max(0, maximum - 6)] >= 0.50
         ) + 3
-        if not candidates.size:
-            return 0
-
         chroma = np.flip(base_chroma, axis=axis) if reverse else base_chroma
         gray = np.flip(base_gray, axis=axis) if reverse else base_gray
 
@@ -530,7 +623,7 @@ def detect_single_sided_neutral_strip_box(
                 )
             ):
                 return depth
-        return 0
+        return gradual_neutral_to_color_depth(axis, reverse, maximum)
 
     max_x = max(1, int(width * 0.28))
     max_y = max(1, int(height * 0.18))
